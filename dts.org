@@ -1,0 +1,2720 @@
+#+TITLE: A meta-logic in Lisp
+#+AUTHOR: skulk
+#+PROPERTY: header-args :results silent
+
+#+begin_src lisp
+  (declare (optimization (speed 3)))
+#+end_src
+
+* Core
+** Debugging utilities
+A lot of errors are very confusing and the source of the issue can't
+be divined from a stack trace. To get around this, we will insert
+print statements all over the place and toggle them with a macro.
+
+#+begin_src lisp
+  (defvar *debugging* nil "Are we debugging?")
+  (defmacro when-debugging (body) (when *debugging* body))
+#+end_src
+
+** Conditions
+#+begin_src lisp
+  (define-condition unification-failure (error)
+    ((pat :initarg :pat
+          :reader unification-failure-pat)
+     (form :initarg :form
+           :reader unification-failure-form)
+     (hint :initarg :hint
+           :type string
+           :initform "No hint, consider adding one."
+           :reader unification-failure-hint))
+    (:report (lambda (condition stream)
+               (format stream "Failed to unify ~s with ~s.~%Hint: ~s"
+                       (unification-failure-pat condition)
+                       (unification-failure-form condition)
+                       (unification-failure-hint condition)))))
+
+  (define-condition undefined-symbol (error)
+    ((form :initarg :form
+           :reader malformed-type-form)
+     (sym :initarg :sym
+          :reader undefined-symbol-sym))
+    (:report (lambda (condition stream)
+               (format stream "Undefined symbol, ~s."
+                       (undefined-symbol-sym condition)))))
+
+  (define-condition illegal-name (error)
+    ((name :initarg :name
+           :reader illegal-name-name))
+    (:report (lambda (condition stream)
+               (format stream "Illegal name, ~s."
+                       (illegal-name-name condition)))))
+
+  (define-condition shadowed-symbol (error)
+    ((form :initarg :form
+           :reader shadowed-symbol-form)
+     (sym :initarg :sym
+          :reader shadowed-symbol-sym))
+    (:report (lambda (condition stream)
+               (format stream "Illegally shadowed symbol, ~s."
+                       (shadowed-symbol-sym condition)))))
+
+  (define-condition type-mismatch (error)
+    ((form :initarg :form
+           :reader malformed-type-form)
+     (needed :initarg :needed
+             :reader type-mismatch-needed)
+     (got :initarg :got
+          :reader type-mismatch-got))
+    (:report (lambda (condition stream)
+               (format stream "Type mismatch~%: needed ~@w,~% got ~@w"
+                       (type-mismatch-needed condition)
+                       (type-mismatch-got condition)))))
+
+  (define-condition malformed-type (error)
+    ((form :initarg :form
+           :reader malformed-type-form))
+    (:report (lambda (condition stream)
+               (format stream "Malformed type: ~s"
+                       (malformed-type-form condition)))))
+
+  (define-condition malformed-expression (error)
+    ((form :initarg :form
+           :reader malformed-expression-form)
+     (hint :initarg :hint
+           :type string
+           :initform "No hint, consider adding one."
+           :reader malformed-expression-hint))
+    (:report (lambda (condition stream)
+               (format stream "Malformed expression: ~s~%Hint: ~s"
+                       (malformed-expression-form condition)
+                       (malformed-expression-hint condition)))))
+#+end_src
+
+** Unify
+#+begin_src lisp
+  (defun acons-maybe (name form acc &key (if-name-is-nil ""))
+    (when (null name)
+      (error 'unification-failure :pat name :form form
+             :hint if-name-is-nil))
+  
+    (let ((val (assoc name acc)))
+      (cond ((null val) (acons name form acc))
+  
+          ((equal (cdr val) form) acc)
+          (t (error 'unification-failure
+                    :pat (cdr val) :form form
+                    :hint (format nil "conflicting match of ~a" name))))))
+  
+  (defun unify (pat form &optional (acc nil))
+    (cond
+      ((and (null pat) (null form)) acc)
+      ((atom pat) (acons-maybe pat form acc))
+      ((eql (car pat) '&atom)
+       (if (null (cadr pat)) acc
+           (if (atom form)
+               (acons-maybe (cadr pat) form acc
+                            :if-name-is-nil "put an identifier after &atom")
+               (error 'unification-failure
+                      :pat pat :form form
+                      :hint "expected an atom, got something non-atomic"))))
+      ((and (eql (car pat) '&literal))
+       (if (equal (cadr pat) form)
+           acc
+           (error 'unification-failure :pat pat :form form)))
+      ((and (eql (car pat) '&rest))
+       (acons-maybe (car (cdr pat)) form acc :if-name-is-nil "put an identifier after the &rest."))
+      ((and (consp pat) (consp form))
+       (unify (cdr pat) (cdr form) (unify (car pat) (car form) acc)))
+      (t (error 'unification-failure :pat pat :form form))))
+#+end_src
+
+** Environment
+#+begin_src lisp
+  (defstruct env
+    parent
+    (values (make-hash-table))
+    (types (make-hash-table))
+    (subst-rules (make-hash-table))
+    (equiv-rules (make-hash-table))
+    (deduction-rules (make-hash-table))
+    (reduction-rules (make-hash-table))
+  
+    (deduction-cache (make-hash-table))
+    (reduction-cache (make-hash-table)))
+  
+  (defun env-drop-caches (env)
+    (setf (env-deduction-cache env) (make-hash-table))
+    (setf (env-reduction-cache env) (make-hash-table)))
+  
+  (defun env-has-definition (env sym)
+    (or (env-get env :value sym) (env-get env :type sym)))
+  
+  (defun env-gen-sym (env base &key (banned '()))
+    (loop for i from 1 to 1000
+          for sym = (intern (concatenate 'string (write-to-string base) (write-to-string i)))
+          when (not (or (env-get env :type sym) (member sym banned)))
+            return sym))
+  
+  (defun env-get (env loc name)
+    (let ((accessor (cond
+                      ((eql loc :value) 'env-values)
+                      ((eql loc :type) 'env-types)
+                      ((eql loc :subst-rule) 'env-subst-rules)
+                      ((eql loc :equiv-rule) 'env-equiv-rules)
+                      ((eql loc :reduction-rule) 'env-reduction-rules)
+                      ((eql loc :deduction-rule) 'env-deduction-rules))))
+      (and env
+           (or (gethash name (funcall accessor env))
+               (env-get (env-parent env) loc name)))))
+  
+  (defun env-set (env loc name val)
+    (clrhash (env-reduction-cache env))
+    (clrhash (env-deduction-cache env))
+    (cond
+      ((consp loc) (mapcar (lambda (l) (env-set env l name val)) loc))
+      ((eql loc :value) (setf (gethash name (env-values env)) val))
+      ((eql loc :type) (setf (gethash name (env-types env)) val))
+      ((eql loc :subst-rule) (setf (gethash name (env-subst-rules env)) val))
+      ((eql loc :equiv-rule) (setf (gethash name (env-equiv-rules env)) val))
+      ((eql loc :reduction-rule) (setf (gethash name (env-reduction-rules env)) val))
+      ((eql loc :deduction-rule) (setf (gethash name (env-deduction-rules env)) val)))
+    env)
+  
+  (defun env-define (env name &key type value)
+    (env-set env :type name type)
+    (env-set env :value name value))
+  
+  (defun env-define-checked (env name &key type value)
+    (let* ((type-reduced (env-reduce env type))
+           (value-reduced (env-reduce env value))
+           (value-type (env-deduce-type env value-reduced)))
+      (env-type-check env type value-type)
+      (env-define env name :type type :value value)
+      t))
+  
+  (defun env-apply-bindings (env bindings)
+    "For each (KEY . VALUE) entry in alist BINDINGS, define a symbol KEY
+    in ENV with value VALUE and type (env-deduce-type ENV VALUE)"
+    (mapcar (lambda (binding)
+              (env-set env :value (car binding)
+                       (cdr binding))
+              (env-set env :type (car binding)
+                       (env-deduce-type env (cdr binding))))
+            bindings)
+    env)
+  
+  (defvar default-env (make-env :parent nil))
+  (setq default-env (make-env :parent nil))
+  
+#+end_src
+
+** Rules
+*** Rule application
+#+begin_src lisp
+  (defun env-apply-rule (env form pat replfn args)
+    (let ((unif (unify pat form)))
+      (funcall replfn env form unif args)))
+  
+  (defun env-for-all-rules (env rule-kind fn args)
+    (if (null env)
+        nil
+        (let ((rule-table
+               (cond ((eql rule-kind :deduction-rule) (env-deduction-rules env))
+                     ((eql rule-kind :reduction-rule) (env-reduction-rules env))
+                     ((eql rule-kind :subst-rule) (env-subst-rules env))
+                     (t (error 'simple-error :format-string "invalid rule kind")))))
+          (block early-stop-catcher
+            (loop for k being each hash-key of rule-table
+               using (hash-value v)
+               do (if (eql :early-stop (funcall fn k v args))
+                      (return-from early-stop-catcher :early-stop)))
+            (env-for-all-rules (env-parent env) rule-kind fn args)))))
+  
+  (defun terminal-expression (form)
+    (cons nil form))
+  (defun intermediate-expression (form)
+    (cons t form))
+  
+  (defun env-apply-all-rules (env rule-kind form &optional (args nil))
+    (let ((terminal nil))
+      (env-for-all-rules env rule-kind
+                         (lambda (k v args)
+                           (handler-case
+                               (progn
+                                 (let* ((retval (env-apply-rule env form k v args))
+                                        (modified (car retval))
+                                        (result (cdr retval)))
+                                   (when-debugging
+                                    (format t "Applied ~a~%~a to~%~a ->~%~a~%" rule-kind k form result))
+                                   (setf form result)
+                                   (if (not modified)
+                                       (setf terminal t))
+                                   :early-stop))
+                             (unification-failure () nil)))
+                         args)
+      (list terminal form)))
+#+end_src
+
+*** Type deduction
+#+begin_src lisp
+(defun env-symbol-typep (env var)
+  (equal (env-get env :type var) 'U))
+
+(defun env-deduce-type (env form)
+  (let* (;(cached (gethash form (env-deduction-cache env)))
+         (result
+          (cond
+            ;(cached cached)
+            ((null form) nil)
+            ((atom form)
+             (let ((type (env-get env :type form))
+                   (value (env-get env :value form)))
+               (cond ((not (null type)) type)
+                     ((not (null value)) (env-deduce-type env value))
+                     (t (error 'undefined-symbol :sym form)))))
+            ((consp form)
+             (let* ((retval (env-apply-all-rules env :deduction-rule form))
+                    (terminal (car retval))
+                    (reduced (cadr retval)))
+               (cond
+                 (terminal reduced)
+                 ((equal form reduced) reduced)
+                 (t (env-deduce-type env reduced))))))))
+    (setf (gethash form (env-deduction-cache env)) result)
+    result))
+#+end_src
+
+*** Expression reduction
+#+begin_src lisp
+  (defun env-reduce (env form)
+    (when-debugging (format t "REDUCING: ~A~%" form))
+    (let* ((cached (gethash form (env-reduction-cache env)))
+           (result
+            (cond
+              (cached cached)
+              ((null form) nil)
+              ((atom form)
+               (let ((value (env-get env :value form)))
+                 (cond ((null value) '!bail)
+                       ((equal value form) form)
+                       (t (env-reduce env value)))))
+              ((consp form)
+               (let* ((retval (env-apply-all-rules env :reduction-rule form))
+                      (terminal (car retval))
+                      (reduced (cadr retval)))
+                 (cond
+                   ((equal reduced '!bail) reduced)
+                   (terminal reduced)
+                   (t (env-reduce env reduced))))))))
+  
+      (if (equal result '!bail) (setq result form))
+      (setf (gethash form (env-reduction-cache env)) result)
+      (when-debugging
+       (format t "REDUCED:~%~A ->~%~A~%" form result))
+      result))
+  
+#+end_src
+
+*** Substitution
+#+begin_src lisp
+(defun single-subst (env form var value)
+  (cond
+    ((atom form) (if (eql var form) value form))
+    ((consp form)
+     (let* ((retval (env-apply-all-rules env :subst-rule form (list var value)))
+            (terminal (car retval))
+            (reduced (cadr retval)))
+       reduced))))
+
+(defun multiple-subst (env form substs)
+  (reduce (lambda (cur subst)
+            (single-subst env cur (car subst) (cdr subst)))
+          substs
+          :initial-value form))
+#+end_src
+
+* Some ad-hoc unsound type theory
+** keyword lists
+
+#+begin_src lisp
+  
+  (defvar *abstraction-signifiers*
+    '(lam dfn dlm dpr)
+    "If a form starts with one of these symbols, it should be treated as an abstraction 
+  of a single variable.")
+  
+  (defvar *beta-reducible-abstraction-signifiers*
+    '(lam dfn dlm)
+    "The subset of abstraction signifiers that are beta-reducable, or 'callable'.")
+  
+  (defvar *eta-equivalent-abstraction-signifiers*
+    '(lam dlm)
+    "The subset of abstractionn signifiers for which we can apply eta-equivalence.")
+  
+  (defvar *constructors*
+    '(match fn)
+    "Special symbols used to construct values or types")
+  (defvar *reserved-names*
+    '(is &literal &rest &atom)
+    "Special symbols used as syntax")
+  
+  (defvar *symbol-name-banlist*
+    (append *abstraction-signifiers* *constructors* *reserved-names*)
+    "Disallowed variable names")
+  
+  (defun symbol-name-legalp (name)
+    (and (symbolp name) (not (member name *symbol-name-banlist*))))
+#+end_src
+
+*** Predicates
+
+#+begin_src lisp
+(defun abstraction-signifierp (x) (not (null (member x *abstraction-signifiers*))))
+(defun beta-reducible-signifierp (x) (not (null (member x *beta-reducible-abstraction-signifiers*))))
+(defun eta-equivalent-signifierp (x) (not (null (member x *eta-equivalent-abstraction-signifiers*))))
+
+(defun is-callable (form)
+  (block blk
+    (let* ((unif (handler-case (unify '(dtype ((&literal is) (&atom var) domain) codomain) form)
+                   (unification-failure () (return-from blk nil))))
+           (dtype (cdr (assoc 'dtype unif))))
+      (beta-reducible-signifierp dtype))))
+#+end_src
+
+** Defining macro
+#+begin_src lisp
+(defmacro env-define-rule (&key env type match output vars)
+  (let ((types-list (if (listp type) type (list type))))
+    `(progn ,@(mapcar (lambda (rule-type)
+                        `(env-set ,env ,rule-type ',match
+                                  (lambda (env form unif &optional (args nil))
+                                    (let ,(mapcar (lambda (v) `(,v (cdr (assoc ',v unif)))) vars)
+                                      ,output))))
+                      types-list))))
+#+end_src
+
+** Type constructors and computation rules
+*** Function
+**** Function type
+***** Construction
+#+begin_src lisp
+(env-define-rule :env default-env
+                 :type (:deduction-rule :reduction-rule)
+                 :match ((&literal fn) domain codomain)
+                 :vars (domain codomain)
+                 :output
+                 (let ((domain-r (env-reduce env domain))
+                       (codomain-r (env-reduce env codomain)))
+                   (terminal-expression `(fn ,domain-r ,codomain-r))))
+#+end_src
+
+***** beta-reduction
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type (:deduction-rule :reduction-rule)
+                   :match (((&literal fn) domain codomain) value)
+                   :vars (domain codomain value)
+                   :output
+                   (let ((value-type (env-reduce env (env-deduce-type env value)))
+                         (domain-r (env-reduce env domain))
+                         (codomain-r (env-reduce env codomain)))
+                     (env-type-check env domain-r value-type)
+                     (terminal-expression codomain-r)))
+#+end_src
+
+**** Lambda expression
+***** Construction
+#+begin_src lisp
+  
+  (env-define-rule :env default-env
+                   :type :deduction-rule
+                   :match ((&literal lam) ((&literal is) (&atom var) domain) ret)
+                   :vars (var domain ret)
+                   :output
+                   (if (not (symbol-name-legalp var))
+                       (error 'illegal-name :name var)
+                       (let* ((domain-r (env-reduce env domain))
+                              (sub-env (env-set (make-env :parent env) :type var domain-r))
+                              (ret-type (env-deduce-type sub-env ret)))
+                         (terminal-expression `(fn ,domain-r ,ret-type)))))
+  
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match ((&literal lam) ((&literal is) (&atom var) domain) ret)
+                   :vars (var domain ret)
+                   :output
+                   (if (not (symbol-name-legalp var))
+                       (error 'illegal-name :name var)
+                       (let ((domain-r (env-reduce env domain)))
+                         (terminal-expression `(lam (is ,var ,domain-r) ,ret)))))
+  
+#+end_src
+
+***** beta-reduction
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match (((&literal lam) ((&literal is) (&atom var) domain) ret) arg)
+                   :vars (var domain ret arg)
+                   :output
+                   (if (not (symbol-name-legalp var))
+                       (error 'illegal-name :name var)
+                       (let ((arg-type (handler-case (env-reduce env (env-deduce-type env arg))
+                                         (undefined-symbol () nil)))
+                             (domain-r (env-reduce env domain)))
+                         ;; If it's a free variable, there's no need to type check it
+                         (when arg-type (env-type-check env domain-r arg-type))
+                         ;; Reducing the argument here can lose important type information, unfortunately.
+                         (terminal-expression
+                          (env-reduce env (single-subst env ret var arg))))))
+  
+  (env-define-rule :env default-env
+                   :type :deduction-rule
+                   :match (((&literal lam) ((&literal is) (&atom var) domain) ret) arg)
+                   :vars (var domain ret arg)
+                   :output
+                   (if (not (symbol-name-legalp var))
+                       (error 'illegal-name :name var)
+                       (let ((arg-type (handler-case (env-reduce env (env-deduce-type env arg))
+                                         (undefined-symbol () nil)))
+                             (domain-r (env-reduce env domain)))
+                         ;; If it's a free variable, there's no need to type check it
+                         (when arg-type (env-type-check env domain-r arg-type))
+                         (let* ((sub-env ((lambda (sub-env)
+                                            (env-set sub-env :type var domain-r)
+                                            (env-set sub-env :value var arg)
+                                            sub-env)
+                                          (make-env :parent env))))
+                           (terminal-expression (single-subst env (env-deduce-type sub-env ret) var arg))))))
+#+end_src
+
+*** Dependent function
+**** Dependent function type
+***** Construction
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type (:deduction-rule :reduction-rule)
+                   :match ((&literal dfn) ((&literal is) (&atom var) domain) codomain)
+                   :vars (var domain codomain)
+                   :output
+                   (if (not (symbol-name-legalp var))
+                       (error 'illegal-name :name var)
+                       (terminal-expression
+                        (let* ((domain-r (env-reduce env domain))
+                               (sub-env (env-set (make-env :parent env) :type var domain-r)))
+                          `(dfn (is ,var ,domain-r) ,codomain)))))
+  
+#+end_src
+
+***** beta-reduction
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match (((&literal dfn) ((&literal is) (&atom var) domain) codomain) arg)
+                   :vars (var domain codomain arg)
+                   :output (intermediate-expression `((lam (is ,var ,domain) ,codomain) ,arg)))
+#+end_src
+
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :deduction-rule
+                   :match (((&literal dfn)
+                            ((&literal is) (&atom var) domain) codomain)
+                           arg)
+                   :vars (var domain codomain arg)
+                   :output
+                   (if (not (symbol-name-legalp var))
+                       (error 'illegal-name :name var)
+                       (let* ((domain-r (env-reduce env domain))
+                              (arg-type (env-reduce env (env-deduce-type env arg)))
+                              (sub-env (env-set (make-env :parent env) :value var arg)))
+                         (env-type-check env domain-r arg-type)
+                         (terminal-expression (env-reduce env (single-subst env codomain var arg))))))
+#+end_src
+
+**** Dependent lambda (dependent type)
+For the most part, this behaves like a normal lambda. The only real
+difference is its deduced type.
+***** Constructor
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match ((&literal dlm) ((&literal is) (&atom var) domain) ret)
+                   :vars (var domain ret)
+                   :output
+                   (if (not (symbol-name-legalp var))
+                       (error 'illegal-name :name var)
+                       (let ((domain-r (env-reduce env domain)))
+                         (terminal-expression `(dlm (is ,var ,domain-r) ,ret)))))
+  
+  (env-define-rule :env default-env
+                   :type :deduction-rule
+                   :match ((&literal dlm) ((&literal is) (&atom var) domain) ret)
+                   :vars (var domain ret)
+                   :output
+                   ;; make this readable
+                   (let ((ret-type (env-deduce-type ((lambda ()
+                                                       (let ((sub-env (make-env :parent env)))
+                                                         (env-set sub-env :type var domain)
+                                                         sub-env)))
+                                                    ret)))
+                     (intermediate-expression
+                      `(dfn (is ,var ,domain) ,ret-type))))
+  
+#+end_src
+
+***** beta-reduction
+Rewrite it as a ~lam~. The semantics are exactly the same.
+
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type (:deduction-rule :reduction-rule)
+                   :match (((&literal dlm) ((&literal is) (&atom var) domain) ret) arg)
+                   :vars (var domain ret arg)
+                   :output
+                   (intermediate-expression `((lam (is ,var ,domain) ,ret) ,arg)))
+  
+#+end_src
+
+***** Dependent family lambda
+The above definition cannot instantiate a dependent family of types
+without resorting to some trickery. ~(dlm (is parameter Type) (TypeFamily parameter))~
+won't work because it'll end up being deduced as something like
+~(dfn (is parameter Type) U)~ which is no good. The solution here is
+to wrap the inside in a lambda
+~(dlm (is parameter Type) ((lam (is parameter2 Type) (TypeFamily parameter2)) parameter))~
+which is painfully long, even with shorter variable names.
+
+To allow more ergonomically defined dependent type families, we
+define a special form of ~dlm~:
+
+****** Constructor
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match ((&literal dlm) ((&literal is) (&atom var) domain) (&literal family) ret)
+                   :vars (var domain ret)
+                   :output
+
+                   (terminal-expression `(dlm (is ,var ,(env-reduce env domain)) family ,ret)))
+  
+  (env-define-rule :env default-env
+                   :type :deduction-rule
+                   :match ((&literal dlm) ((&literal is) (&atom var) domain) (&literal family) ret)
+                   :vars (var domain ret)
+                   :output
+                   (intermediate-expression `(dfn (is ,var ,domain) ,ret)))
+#+end_src
+
+****** Eliminator
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match (((&literal dlm) ((&literal is) (&atom var) domain) (&literal family) ret) arg)
+                   :vars (var domain ret arg)
+                   :output
+                   (intermediate-expression `((lam (is ,var ,domain) ,ret) ,arg)))
+  
+#+end_src
+
+*** Dependent pair
+#+begin_src lisp
+(env-define-rule :env default-env
+                 :type (:deduction-rule :reduction-rule)
+                 :match ((&literal dpr) ((&literal is) (&atom var) domain) codomain)
+                 :vars (var domain codomain)
+                 :output (terminal-expression
+                               (let* ((domain-r (env-reduce env domain))
+                                      (sub-env (env-set (make-env :parent env) :type var domain-r))
+                                      (codomain-r (env-reduce sub-env codomain)))
+                                 `(dpr (is ,var ,domain-r) ,codomain-r))))
+#+end_src
+
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match ((&literal pair) left right)
+                   :vars (left right)
+                   :output
+                   (terminal-expression `(pair
+                                          ,(env-reduce env left)
+                                          ,(env-reduce env right))))
+  (env-define-rule :env default-env
+                   :type :deduction-rule
+                   :match ((&literal pair) left right)
+                   :vars (left right)
+                   :output
+                   (terminal-expression `(pair-type-of
+                                          ,(env-deduce-type env left)
+                                          ,(env-deduce-type env right)
+                                          ,(env-reduce env left)
+                                          ,(env-reduce env right))))
+  
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match ((&literal pair-type-of) left-type right-type left right)
+                   :vars (left-type right-type left right)
+                   :output
+                   (terminal-expression `(pair-type-of
+                                          ,(env-reduce env left-type)
+                                          ,(env-reduce env right-type)
+                                          ,(env-reduce env left)
+                                          ,(env-reduce env right))))
+#+end_src
+
+** Syntactic constructs
+*** Match
+**** Deduction rule
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :deduction-rule
+                   :match ((&literal match) domain codomain arg pat result default)
+                   :vars (domain codomain arg pat default)
+                   :output
+                   (let ((domain-r (env-reduce env domain))
+                         (codomain-r (env-reduce env codomain))
+                         (arg-type (env-deduce-type env arg)))
+                     (if (env-type-equivalentp env domain-r arg-type)
+                         (cons (not (env-symbol-typep env codomain-r)) codomain-r)
+                         (error 'type-mismatch :form form :needed domain-r :got arg-type))))
+  
+#+end_src
+
+**** Reduction rule
+#+begin_src lisp
+  (env-define-rule :env default-env
+                   :type :reduction-rule
+                   :match ((&literal match) domain codomain arg pat result default)
+                   :vars (domain codomain arg pat result default)
+                   :output
+                   (let ((arg-r (env-reduce env arg)))
+                     (when-debugging (format t "===========MATCH    ~a    ~a~%default ~a~%" pat arg-r default))
+                     (if (and (atom arg-r) (not (env-get env :value arg-r)))
+                         (terminal-expression '!bail)
+                         (handler-case
+                             (let* ((domain-r (env-reduce env domain))
+                                    (codomain-r (env-reduce env codomain))
+                                    (pat-unif (unify pat arg-r))
+                                    (sub-env (env-apply-bindings (make-env :parent env) pat-unif))
+                                    (result-r (env-reduce sub-env result))
+                                    (result-type (env-deduce-type env result-r)))
+                               (if (env-type-equivalentp env codomain-r result-type)
+                                   (intermediate-expression result-r)
+                                   (error 'type-mismatch :form form :needed codomain-r :got result-type
+                                          )))
+                           (unification-failure () (intermediate-expression default))))))
+  
+#+end_src
+
+*** Syntax sugar
+
+This section is for stuff that assumes symbols defined later. They
+have to appear before the catch-all function call rule so that they
+get applied first. Otherwise, things go bad.
+
+TODO: rule priority or some better workaround
+
+**** Convenience syntax for chaining path concatenation
+
+This conservative extension flattens long chains of path
+concatenation. Without this, long proofs will get nested very deep.
+
+#+begin_src lisp
+  (defun make-equal-chain (type start last pairs)
+    (when (not (= 2 (length (car pairs)) (length (cadr pairs))))
+      (error 'malformed-expression
+             :form pairs
+             :hint "expected a pair (VALUE PROOF-THAT-VALUE-EQUALS-PREVIOUS-VALUE)"))
+    (list 'equal-transitive
+          type
+          start
+          (car (car pairs))
+          (car last)
+          (cadr (car pairs)) ; proof that start == (car (car pairs))
+          (if (= (length pairs) 2)
+              (cadr (cadr pairs))
+              (make-equal-chain type (car (car pairs)) last (cdr pairs)))))
+  
+  (env-define-rule :env default-env
+                   :type (:reduction-rule :deduction-rule)
+                   :match ((&literal equal-chain) type start &rest pairs)
+                   :vars (type start pairs)
+                   :output
+                   (intermediate-expression
+                    (if (< (length pairs) 2)
+                        (error 'malformed-expression :form form :hint "need at least three values to start a chain")
+                        (make-equal-chain type start (car (last pairs)) pairs))))
+  
+#+end_src
+
+*** Catch-all function call
+**** Deduction rule
+#+begin_src lisp
+(env-set default-env :deduction-rule '(fn &rest args)
+         (lambda (env form unif &optional (args nil))
+           (let* ((fn (cdr (assoc 'fn unif)))
+                  (fn-type (env-deduce-type env fn))
+                  (continue (not (equal fn fn-type)))
+                  (wrapper (if continue #'intermediate-expression #'terminal-expression))
+                  (args (cdr (assoc 'args unif))))
+             (cond ((null args) (error 'malformed-type :form form))
+                   ((null (cdr args)) (funcall wrapper `(,fn-type ,@args)))
+                   (t (funcall wrapper
+                            (if continue
+                                `((,fn-type ,(car args)) ,@(cdr args))
+                                `(,fn-type ,(car args) ,@(cdr args)))))))))
+
+
+#+end_src
+
+**** Reduction rule
+#+begin_src lisp
+  (env-set default-env :reduction-rule '(fn &rest args)
+           (lambda (env form unif &optional (args nil))
+             (declare (ignore args))
+             (let* ((fn (cdr (assoc 'fn unif)))
+                    (args (cdr (assoc 'args unif))))
+               (if (null args) (error 'malformed-expression :form form)
+                   (let ((fn-reduced (env-reduce env fn))
+                         )
+                     (if (and (equal fn fn-reduced) (not (is-callable fn)))
+                         (let ((car-args-reduced (env-reduce env (car args)))
+                               (cdr-args-reduced (mapcar (lambda (x) (env-reduce env x)) (cdr args))))
+                           (if (null (cdr args))
+                               (terminal-expression `(,fn-reduced ,car-args-reduced))
+                               (terminal-expression `(,fn-reduced ,car-args-reduced ,@cdr-args-reduced))))
+                         (if (null (cdr args))
+                             (intermediate-expression `(,fn-reduced ,@args))
+                             (intermediate-expression `((,fn-reduced ,(car args)) ,@(cdr args))))))))))
+  
+#+end_src
+
+*** Substitution (or, why you use de Brujin indices)
+   Not complete.
+#+begin_src lisp
+  (defun atoms-of-form (form)
+    (cond
+      ((atom form) (list form))
+      ((consp form) (append (atoms-of-form (car form))
+                            (atoms-of-form (cdr form))))))
+    
+  
+  (env-define-rule :env default-env
+                   :type :subst-rule
+                   :match (dtype ((&literal is) var domain) &rest rest)
+                   :vars (dtype var domain rest)
+                   :output
+                   (let* ((needle (car args))
+                          (replacement (cadr args))
+                          (replacement-atoms (atoms-of-form replacement))
+                          (needs-replacement (member var replacement-atoms))
+                          (sym (if needs-replacement (env-gen-sym env var :banned replacement-atoms) nil))
+                          (fixed-var (if needs-replacement sym var))
+                          (fixed-domain (if needs-replacement
+                                            (single-subst env domain var sym)
+                                            domain))
+                          (fixed-rest (if needs-replacement
+                                          (map 'list (lambda (r) (single-subst env r var sym)) rest)
+                                          rest))
+                          (final-var (single-subst env fixed-var needle replacement))
+                          (final-domain (single-subst env fixed-domain needle replacement))
+                          (final-rest (map 'list (lambda (r) (single-subst env r needle replacement)) fixed-rest)))
+  
+                                          (format t "subst in ~a:~%   needle: ~a~%   replacement: ~a~%" form needle replacement)
+                     (terminal-expression `(,dtype (is ,final-var ,final-domain) ,@final-rest))))
+  
+  (env-define-rule :env default-env
+                   :type :subst-rule
+                   :match (fn &rest fn-args)
+                   :vars (fn fn-args)
+                   :output
+                   (let* ((needle (car args))
+                          (replacement (cadr args)))
+                     (terminal-expression (cons (single-subst env fn needle replacement)
+                                                (single-subst env fn-args needle replacement)))))
+  
+#+end_src
+
+** Judgemental type equivalence and membership
+*** Discussion
+  This is not propositional type equivalence.
+
+  We need to make sure ~(pair-type-of x y)~ is judged equivalent to
+  the type ~(dpr (is v type-of-x) type-of-y)~ or
+  ~(pr type-of-x type-of-y)~ for the purpose of checking type
+  membership (proofs).
+
+  Alpha equivalence for ~(dpr (is x D) C)~ and ~(dfn (is x D) C)~
+
+  And structural equivalent for most other types.
+
+*** Entry point
+#+begin_src lisp
+  (defun env-type-check (env t1 t2)
+    (when-debugging (format t "type check: ~a vs ~a~%" t1 t2))
+    (when (or
+           (equal t1 'trust-me-bro)
+           (equal t1 'U)
+           (equal t2 'U)
+           (equal t1 t2)
+           (env-product-type-equivalentp env t1 t2)
+           (env-dproduct-type-equivalentp env t1 t2)
+           (env-dfn-type-equivalentp env t1 t2)
+           (env-dfn-constant-equivalentp env t1 t2)
+           (env-eta-equivalentp env t1 t2)
+           (env-eta-equivalentp env t2 t1)
+           (env-complex-type-equivalentp env (env-reduce env t1) (env-reduce env t2)))
+      t))
+  
+  (defun env-type-equivalentp (env t1 t2)
+    (format t "TYPE EQUIVALENTP ~%~a and~%~a~%~%" t1 t2)
+    (let ((result (handler-case
+                      (prog2 (env-type-check env t1 t2) t)
+                    (type-mismatch () nil)
+                    (type-inequivalent () nil))))
+      (format t "TYPE EQUIVALENTP ~a~%~a and~%~a~%~%" result t1 t2)
+      result))
+  
+  (defun env-type-memberp (env type value)
+    (env-type-equivalentp env (env-reduce env type) (env-deduce-type env value)))
+#+end_src
+
+**** Control flow conditions
+  TODO: don't do it this way. It's messy. Just throw type mismatch if
+  we're sure it doesn't match.
+
+  If the types don't match in one way, we may want to check the rest
+  of the ways. However, sometimes we do know that the types are
+  necessarily inequivalent. That's when we should throw this condition.
+
+#+begin_src lisp
+  (define-condition type-inequivalent (error) nil)
+#+end_src
+
+*** Product satisfaction
+#+begin_src lisp
+  (defun env-product-type-equivalentp (env pr-type pair-type)
+    (handler-case
+        (let* ((product-type-unif
+                 (unify '(((&literal pr) left-type right-type)
+                          ((&literal pair-type-of) left-type2 right-type2 left right))
+                        (list pr-type pair-type)))
+               (left-type   (cdr (assoc 'left-type   product-type-unif)))
+               (right-type  (cdr (assoc 'right-type  product-type-unif)))
+               (left-type2  (cdr (assoc 'left-type2  product-type-unif)))
+               (right-type2 (cdr (assoc 'right-type2 product-type-unif))))
+  
+          (env-type-check env left-type left-type2)
+          (env-type-check env right-type right-type2)
+          t)
+  
+      (unification-failure () nil)))
+#+end_src
+
+*** Dependent product satisfaction
+#+begin_src lisp
+  (defun env-dproduct-type-equivalentp (env dpr-type pair-type)
+    (handler-case
+        (let* ((pair-type-unif
+                 (unify '(((&literal dpr) ((&literal is) (&atom var) domain) codomain)
+                          ((&literal pair-type-of) left-type right-type left right))
+                        (list dpr-type pair-type)))
+               (var      (cdr (assoc 'var      pair-type-unif)))
+               ;; note: these should already be reduced
+               (domain   (cdr (assoc 'domain   pair-type-unif)))
+               (codomain (cdr (assoc 'codomain pair-type-unif)))
+
+               (left    (cdr (assoc 'left  pair-type-unif)))
+               (right   (cdr (assoc 'right pair-type-unif)))
+  
+               (left-type    (cdr (assoc 'left-type  pair-type-unif)))
+               (right-type   (cdr (assoc 'right-type pair-type-unif)))
+  
+               (sub-env ((lambda (sub-env)
+                           (env-set sub-env :type var domain)
+                           (env-set sub-env :value var left))
+                         (make-env :parent env)))
+               (codomain-r (env-reduce sub-env codomain)))
+  
+          (env-type-check env domain left-type)
+          (env-type-check sub-env codomain-r right-type)
+          t)
+      (unification-failure () nil)))
+  
+#+end_src
+
+*** Dependent function eta equivalence
+#+begin_src lisp
+  (defun env-dfn-type-equivalentp (env dfn1 dfn2)
+    (define-condition invalid-dtype (error) nil)
+    (handler-case
+        (let* ((dfn-unif
+                 (unify '((dtype  ((&literal is) (&atom var-l) domain-l) codomain-l)
+                          (dtype  ((&literal is) (&atom var-r) domain-r) codomain-r))
+                        (list dfn1 dfn2)))
+               (dtype      (cdr (assoc 'dtype      dfn-unif)))
+               (dummy      (when (not (abstraction-signifierp dtype)) (error 'invalid-dtype)))
+               (var-l      (cdr (assoc 'var-l      dfn-unif)))
+               (var-r      (cdr (assoc 'var-r      dfn-unif)))
+               (domain-l   (cdr (assoc 'domain-l   dfn-unif)))
+               (domain-r   (cdr (assoc 'domain-r   dfn-unif)))
+               (codomain-l (cdr (assoc 'codomain-l dfn-unif)))
+               (codomain-r (cdr (assoc 'codomain-r dfn-unif)))
+               ;(_ (format t "domain-l:~a~%domain-r:~a~%" domain-l domain-r))
+  
+               (domain-equivalent (env-type-check env domain-l domain-r))
+               (fixed-codomain-r (single-subst env codomain-r var-r var-l))
+               ;(_ (format t "codomain-l:~a~%codomain-r:~a~%" codomain-l codomain-r))
+  
+               (codomain-equivalent
+                 (let ((sub-env
+                         (env-set (make-env :parent env)
+                                  :type var-l
+                                  (env-reduce env domain-l))))
+                   ;(format t "codomain-l reduced~%~a~%" (env-reduce sub-env codomain-l))
+                   (env-type-check
+                    sub-env 
+                    (env-reduce sub-env codomain-l)
+                    (env-reduce sub-env fixed-codomain-r)))))
+          t)
+      (invalid-dtype () nil)
+      (unification-failure () nil)))
+  
+#+end_src
+
+*** Dependent constant function demotion to function
+
+  This one's purely for convenience. We could just slap a lambda
+  around top of the dependent function and pass in the parameter, but
+  that's pointful and therefore pointless. (of course, it makes the proof
+  harder to read but whatever)
+
+#+begin_src lisp
+  (defun env-dfn-constant-equivalentp (env fn constant-dfn)
+    (handler-case
+        (let* ((dfn-unif
+                 (unify '(((&literal dfn) ((&literal is) (&atom var) domain-r) codomain-r)
+                          ((&literal fn) domain-l codomain-l))
+                        (list constant-dfn fn)))
+               (dtype      (cdr (assoc 'dtype      dfn-unif)))
+               (var        (cdr (assoc 'var        dfn-unif)))
+               (domain-l   (cdr (assoc 'domain-l   dfn-unif)))
+               (domain-r   (cdr (assoc 'domain-r   dfn-unif)))
+               (codomain-l (cdr (assoc 'codomain-l dfn-unif)))
+               (codomain-r (cdr (assoc 'codomain-r dfn-unif)))
+  
+               (domain-equivalent (env-type-check env domain-l domain-r))
+               (codomain-equivalent
+                 (let ((sub-env (env-set (make-env :parent env) :type var (env-reduce env domain-r))))
+                   (env-type-check
+                    sub-env
+                    (env-reduce sub-env codomain-l)
+                    (env-reduce sub-env codomain-r)))))
+          t)
+      (unification-failure () nil)))
+  
+#+end_src
+  
+*** Structural type equivalence
+#+begin_src lisp
+  (defun env-complex-type-equivalentp (env t1 t2)
+    (cond
+      ((and (null t1) (null t2)) t) 
+      ((and (consp t1) (consp t2))
+       (progn
+         (env-type-check env (car t1) (car t2))
+         (env-complex-type-equivalentp env (cdr t1) (cdr t2))
+         t))
+      (t (error 'type-mismatch
+                :form (list 'assert-equivalent t1 t2)
+                :needed t1
+                :got t2))))
+#+end_src
+
+*** Eta-equivalence
+#+begin_src lisp
+  (defun env-eta-equivalentp (env pointfree pointful)
+    (handler-case
+        (let* ((fn-unif (unify '((&atom dtype) ((&literal is) (&atom var) domain) ret) pointful))
+               (dtype  (cdr (assoc 'dtype  fn-unif)))
+               (var    (cdr (assoc 'var    fn-unif)))
+               (domain (cdr (assoc 'domain fn-unif)))
+               (ret    (cdr (assoc 'ret    fn-unif)))
+  
+               (sub-env ((lambda (env)
+                           (env-set env :type var domain)
+                           (env-set env :value var var))
+                         env)))
+  
+          (if (eta-equivalent-signifierp dtype)
+              (env-type-check sub-env
+                              (cond
+                                ((consp pointfree) (append pointfree var))
+                                (t (list pointfree var)))
+                              (env-reduce sub-env ret))))
+      (unification-failure () nil)))
+#+end_src
+
+** Basic types
+*** The universe
+By convention, we'll use U for the universe. We'll also naively take
+U to be of type U. This leads to Girard's paradox, but we'll ignore
+that for now. The plan is to fix this by introducing a hierarchy of
+universes, I'm just too lazy to do that right now especially because
+I haven't yet gotten around to univalence and it doesn't affect things
+that much. It might be tricky to migrate to a more sound system.
+
+#+begin_src lisp
+  (env-set default-env :type 'U 'U)
+#+end_src
+
+Also, calling the universe as a type should be explicitly
+forbidden. That is to say, ~(U something)~ should be a hard error.
+
+#+begin_src lisp
+  (env-set default-env :deduction-rule '((&literal U) &rest args)
+           (lambda (env form unif &optional (args nil))
+             (declare (ignore env) (ignore unif) (ignore args))
+             (error 'malformed-type :form form
+                                    :hint "No matter how many times you try, the universe ignores your calls.")))
+#+end_src
+
+*** The empty type
+This is the proposition "False".
+
+By convention, we shouldn't define anything to be of type ~E~.
+
+#+begin_src lisp
+  (env-set default-env :type 'E 'U)
+#+end_src
+
+* Playground
+** Syntax sugar
+#+begin_src lisp
+  ;; sugar
+  (defun make-abstraction-chain (dtype vars body &optional (postamble (lambda (x) nil)))
+    (if (null vars)
+        body
+        (let ((binding (car vars)))
+          (when (not (or (consp binding) (>= 2 (length binding))))
+            (error 'malformed-expression
+                   :form binding
+                   :hint "needed a length 2 list (ATOM ANY), instead got something else"))
+          (let* ((post (funcall postamble binding))
+                 (abstr `(,dtype (is ,(car binding) ,(cadr binding))
+                                 ,(make-abstraction-chain dtype (cdr vars) body postamble))))
+  
+            (if (null post) abstr `(,abstr ,@post))))))
+  (defun forall (vars body)
+    (make-abstraction-chain 'dfn vars body))
+  (defun given (vars body)
+    (make-abstraction-chain 'dlm vars body))
+  
+  (defun with-named-forms (env vars body)
+    (make-abstraction-chain 'lam (map 'list (lambda (x)
+                                              `(,(car x) ,(env-deduce-type env (cadr x)) ,(cadr x)))
+                                      vars)
+                            body
+                            (lambda (binding) (list (cadr (cdr binding))))))
+  
+#+end_src
+
+** Functions
+*** Identity function
+#+begin_src lisp
+  (env-define-checked default-env 'id
+                      :type (forall '((T1 U))
+                                    '(fn T1 T1))
+                      :value (given '((T1 U))
+                                    '(lam (is value T1) value)))
+  
+  (env-define-checked default-env 'idd
+                      :type (forall '((T1 U) (x T1))
+                                    'T1)
+                      :value (given '((T1 U) (value T1))
+                                    'value))
+#+end_src
+
+*** Composition
+#+begin_src lisp
+  (env-define default-env 'compose
+              :value (given '((T1 U) (T2 U) (T3 U)
+                              (f (fn T2 T3))
+                              (g (fn T1 T2)))
+  
+                            '(lam (is x T1) (f (g x)))))
+#+end_src
+
+** The point
+This is the type that has exactly one inhabitant.
+#+begin_src lisp
+  (env-define default-env 'Point :type 'U     :value 'Point)
+  (env-define default-env 'star  :type 'Point :value 'star)
+#+end_src
+
+TODO: Recursor and inductor
+
+** Product type
+*** Constructor
+#+begin_src lisp
+  (env-define default-env 'pr :type 'pr :value 'pr)
+#+end_src
+
+*** Projections
+#+begin_src lisp
+  
+  (env-define-checked default-env 'car
+                      :type '(dfn (is T1 U)
+                              (dfn (is T2 U)
+                               (fn (pr T1 T2) T1)))
+                      :value '(dlm (is T1 U)
+                               (dlm (is T2 U)
+                                (lam (is x (pr T1 T2))
+                                 (match (pr T1 T2) T1 x
+                                   ((&literal pair) carval cdrval)
+                                   carval error)))))
+  
+  (env-define-checked default-env 'cdr
+                      :type '(dfn (is T1 U)
+                              (dfn (is T2 U)
+                               (fn (pr T1 T2) T2)))
+                      :value '(dlm (is T1 U)
+                               (dlm (is T2 U)
+                                (lam (is x (pr T1 T2))
+                                 (match (pr T1 T2) T2 x
+                                   ((&literal pair) carval cdrval)
+                                   cdrval error)))))
+  
+#+end_src
+
+*** Recursor
+
+    Can also be defined in terms of projections.
+
+#+begin_src lisp
+  (env-define-checked default-env 'rec-pr
+                      :type
+                      (forall '((T1 U) (T2 U) (S1 U) (S2 U)
+                                (pr (pr T1 T2))
+                                (TS1 (fn T1 S1)) (TS2 (fn T2 S2)))
+  
+                              '(pr S1 S2))
+  
+                      :value
+                      (given '((T1 U) (T2 U) (S1 U) (S2 U)
+                               (pair (pr T1 T2))
+                               (TS1 (fn T1 S1)) (TS2 (fn T2 S2)))
+  
+                             '(match (pr T1 T2) (pr S1 S2) pair
+                               ((&literal pair) t1v t2v)
+                               (pair (TS1 t1v) (TS2 t2v))
+                               !bail)))
+#+end_src
+
+*** Inductor
+#+begin_src lisp
+  (env-define-checked default-env 'ind-pr
+                      :type
+                      (forall '((T1 U) (T2 U) (C (fn (pr T1 T2) U)))
+  
+                              '(fn
+                                (dfn (is left T1) (dfn (is right T2) (C (pair left right))))
+                                (dfn (is pair (pr T1 T2)) (C pair))))
+  
+                      :value
+                      (given '((T1 U) (T2 U) (C (fn (pr T1 T2) U)))
+
+                             '(lam (is pred (dfn (is left T1) (dfn (is right T2) (C (pair left right)))))
+                               (dlm (is pair (pr T1 T2))
+                                (match (pr T1 T2) U
+                                  pair
+                                  ((&literal pair) left right)
+                                  (pred left right)
+                                  !bail)))))
+#+end_src
+
+** Dependent product type
+*** Projections
+#+begin_src lisp
+  
+  (env-define-checked default-env 'dcar
+                      :type '(dfn (is T1 U)
+                              (dfn (is TF (fn T1 U))
+                               (fn (dpr (is x T1) (TF x)) T1)))
+                      :value '(dlm (is T1 U)
+                               (dlm (is TF (fn T1 U))
+                                (lam (is dp (dpr (is x T1) (TF x)))
+                                 (match (dpr (is x T1) (TF x)) T1 dp
+                                   ((&literal pair) carval cdrval)
+                                   carval error)))))
+  
+  (env-define-checked default-env 'dcdr
+                      :type '(dfn (is T1 U)
+                              (dfn (is TF (fn T1 U))
+                               (fn (dpr (is x T1) (TF x)) U)))
+                      :value '(dlm (is T1 U)
+                               (dlm (is TF (fn T1 U))
+                                (lam (is dp (dpr (is x T1) (TF x)))
+                                 (match (dpr (is x T1) (TF x)) T1 dp
+                                   ((&literal pair) carval cdrval)
+                                   cdrval error)))))
+#+end_src
+
+*** Inductor
+#+begin_src lisp
+  (env-define-checked default-env 'ind-dpr
+                      :type
+                      (forall '((T1 U)
+                                (TF (fn T1 U))
+                                (C (fn (dpr (is x T1) (TF x)) U)))
+                              '(fn
+                                (dfn (is left T1) (dfn (is right (TF left)) (C (pair left right))))
+                                (dfn (is pair (dpr (is x T1) (TF x))) (C pair))))
+                      :value
+                      (given '((T1 U)
+                               (TF (fn T1 U))
+                               (C (fn (dpr (is x T1) (TF x)) U)))
+                             '(lam (is pred (dfn (is left T1) (dfn (is right (TF left)) (C (pair left right)))))
+                               (dlm (is pair (dpr (is x T1) (TF x)))
+                                (match (dpr (is x T1) (TF x)) U
+                                  pair
+                                  ((&literal pair) left right)
+                                  (pred left right)
+                                  !bail)))))
+#+end_src
+
+** Path space
+*** Definition
+#+begin_src lisp
+  (env-define default-env 'equal
+              :type '(dfn (is T1 U) (dfn (is v1 T1) (dfn (is v2 T1) U)))
+              :value 'equal)
+#+end_src
+
+*** Loops
+#+begin_src lisp
+  (env-define default-env 'refl
+           :type '(dfn (is T1 U)
+                   (dfn (is t1v T1)
+                    (equal T1 t1v t1v)))
+           :value 'refl)
+
+#+end_src
+
+*** Path induction
+Path induction is taken as an axiom.
+
+#+begin_src lisp
+  (env-define default-env  'ind-equal
+              :type '(dfn (is T1 U)
+                      (dfn (is big-d (dfn (is x T1)
+                                          (dfn (is y T1)
+                                               (dfn (is p (equal T1 x y))
+                                                    U))))
+                       (dfn (is little-d (dfn (is val T1)
+                                              (big-d val val (refl T1 val))))
+                        (dfn (is x T1)
+                             (dfn (is y T1)
+                                  (dfn (is p (equal T1 x y))
+                                       (big-d x y p)))))))
+  
+              :value '(dlm (is T1 U)
+                       (dlm (is big-d (dfn (is x T1)
+                                           (dfn (is y T1)
+                                                (dfn (is p (equal T1 x y))
+                                                     U))))
+                        (dlm (is little-d (dfn (is val T1)
+                                               (big-d val val (refl T1 val))))
+                         (dlm (is x T1)
+                              (dlm (is y T1)
+                                   (dlm (is p (equal T1 x y))
+                                        (little-d x))))))))
+  
+#+end_src
+
+*** Path inversion
+#+begin_src lisp
+  (env-define-checked default-env 'equal-symmetric
+                      :type (forall
+                             '((T1 U) (x T1) (y T1))
+  
+                             '(fn (equal T1 x y) (equal T1 y x)))
+  
+                      :value (given 
+                              '((T1 U) (x T1) (y T1))
+  
+                              '(ind-equal
+                                T1
+                                (dlm (is xx T1)
+                                 (dlm (is yy T1)
+                                  (dlm (is pp (equal T1 xx yy))
+                                       (equal T1 yy xx))))
+                                (dlm (is xxx T1) (refl T1 xxx))
+                                x
+                                y)))
+#+end_src
+
+*** Path concatenation
+#+begin_src lisp
+  (env-define-checked default-env 'equal-transitive
+                      :type (forall
+                             '((T1 U) (x1 T1) (x2 T1) (x3 T1))
+  
+                             '(fn (equal T1 x1 x2)
+                               (fn (equal T1 x2 x3)
+                                (equal T1 x1 x3))))
+  
+                      :value (given
+                              '((T1 U) (x1 T1) (x2 T1) (x3 T1))
+  
+                              '(lam (is px1x2 (equal T1 x1 x2))
+                                (lam (is px2x3 (equal T1 x2 x3))
+                                 (ind-equal
+                                  T1
+                                  (dlm (is xx2 T1)
+                                   (dlm (is xx3 T1)
+                                    (dlm (is pxx2xx3 (equal T1 xx2 xx3))
+                                     (dfn (is xx1 T1)
+                                          (dfn (is qxx1xx2 (equal T1 xx1 xx2))
+                                               (equal T1 xx1 xx3))))))
+                                  (dlm (is xx2 T1)
+                                   (dlm (is xx1 T1)
+                                    (dlm (is xx1-eq-xx2 (equal T1 xx1 xx2))
+                                     (ind-equal
+                                      T1
+                                      (dlm (is xxx1 T1)
+                                           (dlm (is xxx2 T1)
+                                                (dlm (is pxxx1xxx2 (equal T1 xxx1 xxx2))
+                                                     (equal T1 xxx1 xxx2))))
+                                      (dlm (is xxx T1) (refl T1 xxx))
+                                      xx1
+                                      xx2
+                                      xx1-eq-xx2))))
+                                  x2
+                                  x3
+                                  px2x3
+                                  x1
+                                  px1x2)))))
+#+end_src
+
+*** Functors
+**** Apply function to path
+#+begin_src lisp
+  (env-define-checked default-env 'ap
+                      :type (forall
+                             '((T1 U) (T2 U) (f (fn T1 T2)) (x1 T1) (x2 T1))
+  
+                             '(fn (equal T1 x1 x2) (equal T2 (f x1) (f x2))))
+  
+                      :value (given
+                              '((T1 U) (T2 U) (f (fn T1 T2)))
+  
+                              '(ind-equal
+                                T1
+                                (dlm (is xx1 T1)
+                                 (dlm (is xx2 T1)
+                                  (dlm (is pp (equal T1 xx1 xx2))
+                                       (equal T2 (f xx1) (f xx2)))))
+                                (dlm (is xx1 T1)
+                                 (refl T2 (f xx1))))))
+#+end_src
+
+**** happly
+ 
+#+begin_src lisp
+  (env-define-checked default-env 'happly
+                      :type (forall
+                             '((T1 U) (TF (fn T1 U))
+                               (df1 (dfn (is val T1) (TF val)))
+                               (df2 (dfn (is val T1) (TF val))))
+  
+                             '(fn
+                               (equal (dfn (is val T1) (TF val)) df1 df2)
+                               (dfn (is val T1) (equal (TF val) (df1 val) (df2 val)))))
+  
+                      :value (given
+                              '((T1 U) (TF (fn T1 U))
+                                (df1 (dfn (is val T1) (TF val)))
+                                (df2 (dfn (is val T1) (TF val))))
+  
+                              '(lam (is hyp (equal (dfn (is val T1) (TF val)) df1 df2))
+                                (dlm (is val T1)
+                                 (ind-equal
+                                  (dfn (is val2 T1) (TF val2))
+                                  (dlm (is df1v (dfn (is val2 T1) (TF val2)))
+                                       (dlm (is df2v (dfn (is val2 T1) (TF val2)))
+                                            (dlm (is df1v-eq-df2v
+                                                     (equal (dfn (is val2 T1) (TF val2))
+                                                            df1v
+                                                            df2v))
+                                                 (equal (TF val) (df1v val) (df2v val)))))
+                                  (dlm (is df1v (dfn (is val2 T1) (TF val2)))
+                                       (ap
+                                        (dfn (is val2 T1) (TF val2))
+                                        (TF val)
+                                        (lam (is dfvv (dfn (is val2 T1) (TF val2)))
+                                             (dfvv val))
+                                        df1v
+                                        df1v
+                                        (refl (dfn (is val2 T1) (TF val2)) df1v)))
+                                  df1
+                                  df2
+                                  hyp)))))
+#+end_src
+
+**** transport
+#+begin_src lisp
+  (env-define-checked default-env 'transport
+                      :type (forall '((T1 U)
+                                      (TF (fn T1 U))
+                                      (x T1)
+                                      (y T1)
+                                      (x-eq-y (equal T1 x y)))
+                                    '(fn (TF x) (TF y)))
+  
+                      :value (given '((T1 U)
+                                      (TF (fn T1 U)))
+                                    '(ind-equal
+                                      T1
+                                      (dlm (is xx T1)
+                                       (dlm (is yy T1)
+                                        (dlm (is xx-eq-yy (equal T1 xx yy))
+                                             family
+                                             (fn (TF xx) (TF yy)))))
+                                      (dlm (is xx T1)
+                                       (lam (is val (TF xx)) val)))))
+#+end_src
+
+
+***** transportconst
+
+#+begin_src lisp
+  (env-define-checked default-env 'transportconst
+                      :type (forall '((T1 U) (T2 U) (x T1) (y T1)
+                                      (x-eq-y (equal T1 x y))
+                                      (b T2))
+                                    '(equal T2 (transport T1 (lam (is v T1) T2) x y x-eq-y b) b))
+  
+                      :value (given '((T1 U) (T2 U) (x T1) (y T1)
+                                      (x-eq-y (equal T1 x y))
+                                      (b T2))
+                                    '(ind-equal
+                                      T1
+                                      (dlm (is x T1)
+                                       (dlm (is y T1)
+                                        (dlm (is x-eq-y (equal T1 x y))
+                                         (equal T2 (transport T1 (lam (is v T1) T2) x y x-eq-y b) b))))
+                                      (dlm (is x T1)
+                                       (refl T2 b))
+                                      x
+                                      y
+                                      x-eq-y)))
+#+end_src
+
+**** lift
+#+begin_src lisp
+(env-define-checked default-env 'lift
+                    :type '(dfn (is T1 U)
+                            (dfn (is TF (fn T1 U))
+                             (dfn (is x T1)
+                              (dfn (is y T1)
+                               (dfn (is x-eq-y (equal T1 x y))
+                                (dfn (is TF-x (TF x))
+                                 (equal
+                                  (dpr (is xx T1) (TF xx))
+                                  (pair x TF-x)
+                                  (pair y (transport T1 TF x y x-eq-y TF-x)))))))))
+                    :value '(dlm (is T1 U)
+                             (dlm (is TF (fn T1 U))
+                              (ind-equal
+                               T1
+                               (dlm (is xx T1)
+                                (dlm (is yy T1)
+                                 (dlm (is xx-eq-yy (equal T1 xx yy))
+                                  (dfn (is TF-xx (TF xx))
+                                       (equal
+                                        (dpr (is xxx T1) (TF xxx))
+                                        (pair xx TF-xx)
+                                        (pair yy (transport T1 TF xx yy xx-eq-yy TF-xx)))))))
+                               (dlm (is xx T1)
+                                (dlm (is TF-xx (TF xx))
+                                 (refl (dpr (is xxx T1) (TF xxx)) (pair xx TF-xx))))))))
+
+#+end_src
+
+**** apply dependent function to path
+#+begin_src lisp
+  (env-define-checked default-env 'apd
+                      :type (forall
+                             '((T1 U) (TF (fn T1 U))
+                               (df (dfn (is x T1) (TF x)))
+                               (x T1) (y T1)
+                               (x-eq-y (equal T1 x y)))
+  
+                             '(equal
+                               (TF y)
+                               (transport T1 TF x y x-eq-y (df x))
+                               (df y)))
+  
+                      :value (given
+                              '((T1 U) (TF (fn T1 U))
+                                (df (dfn (is x T1) (TF x))))
+  
+                              '(ind-equal
+                                T1
+                                (dlm (is xx T1)
+                                 (dlm (is yy T1)
+                                  (dlm (is xx-eq-yy (equal T1 xx yy))
+                                   (equal
+                                    (TF yy)
+                                    (transport T1 TF xx yy xx-eq-yy (df xx))
+                                    (df yy)))))
+                                (dlm (is xx T1)
+                                 (refl (TF xx) (df xx))))))
+#+end_src
+
+*** Homotopy
+**** Definition
+#+begin_src lisp
+  (env-define default-env 'homotopy
+              :value
+              '(dlm (is T1 U)
+                (dlm (is T2 U) 
+                 (lam (is f (fn T1 T2))
+                  (lam (is g (fn T1 T2))
+                       (dfn (is x T1) (equal T2 (f x) (g x))))))))
+#+end_src
+
+**** Theorems
+***** Reflexivity
+#+begin_src lisp
+  (env-define-checked default-env 'homotopy-refl
+                      :type
+                      (forall '((T1 U) (T2 U) (f (fn T1 T2)))
+  
+                              '(homotopy T1 T2 f f))
+  
+                      :value
+                      (given '((T1 U) (T2 U) (f (fn T1 T2)))
+  
+                             '(dlm (is x T1) (refl T2 (f x)))))
+#+end_src
+
+***** Symmetry
+#+begin_src lisp
+  (env-define-checked default-env 'homotopy-symmetric
+                      :type
+                      (forall '((T1 U) (T2 U)
+                                (f (fn T1 T2))
+                                (g (fn T1 T2)))
+  
+                              '(fn (homotopy T1 T2 f g) (homotopy T1 T2 g f)))
+                      :value
+                      (given '((T1 U) (T2 U)
+                               (f (fn T1 T2))
+                               (g (fn T1 T2)))
+  
+                             '(lam (is f-ht-g (homotopy T1 T2 f g))
+                               (dlm (is x T1)
+                                (equal-symmetric
+                                 T2
+                                 (f x)
+                                 (g x)
+                                 (f-ht-g x))))))
+#+end_src
+
+***** Transitivity
+#+begin_src lisp
+  (env-define-checked default-env 'homotopy-transitive
+                      :type
+                      (forall '((T1 U) (T2 U)
+                                (f (fn T1 T2))
+                                (g (fn T1 T2))
+                                (h (fn T1 T2)))
+  
+                              '(fn (homotopy T1 T2 f g) (fn (homotopy T1 T2 g h) (homotopy T1 T2 f h))))
+                      :value
+                      (given '((T1 U) (T2 U)
+                               (f (fn T1 T2))
+                               (g (fn T1 T2))
+                               (h (fn T1 T2)))
+  
+                             '(lam (is f-ht-g (homotopy T1 T2 f g))
+                               (lam (is g-ht-h (homotopy T1 T2 g h))
+                                (dlm (is x T1)
+                                 (equal-transitive
+                                  T2
+                                  (f x)
+                                  (g x)
+                                  (h x)
+                                  (f-ht-g x)
+                                  (g-ht-h x)))))))
+#+end_src
+
+***** Naturality
+This is hott 2.4.3.
+
+#+begin_src lisp
+  (env-define-checked default-env 'homotopy-naturality
+                      :type
+                      (forall '((T1 U) (T2 U)
+                                (f (fn T1 T2))
+                                (g (fn T1 T2))
+                                (f-ht-g (homotopy T1 T2 f g))
+                                (x T1)
+                                (y T1)
+                                (x-eq-y (equal T1 x y)))
+  
+                              '(equal
+                                (equal T2 (f x) (g y))
+                                (equal-transitive
+                                 T2
+                                 (f x)
+                                 (g x)
+                                 (g y)
+                                 (f-ht-g x)
+                                 (ap T1 T2 g x y x-eq-y))
+                                (equal-transitive
+                                 T2
+                                 (f x)
+                                 (f y)
+                                 (g y)
+                                 (ap T1 T2 f x y x-eq-y)
+                                 (f-ht-g y))))
+  
+                      :value
+                      (given '((T1 U) (T2 U)
+                               (f (fn T1 T2))
+                               (g (fn T1 T2))
+                               (f-ht-g (homotopy T1 T2 f g))
+                               (x T1)
+                               (y T1)
+                               (x-eq-y (equal T1 x y)))
+  
+                             '(ind-equal
+                               T1
+                               (dlm (is xv T1)
+                                (dlm (is yv T1)
+                                 (dlm (is xv-eq-yv (equal T1 xv yv))
+                                  (equal
+                                   (equal T2 (f xv) (g yv))
+                                   (equal-transitive
+                                    T2
+                                    (f xv)
+                                    (g xv)
+                                    (g yv)
+                                    (f-ht-g xv)
+                                    (ap T1 T2 g xv yv xv-eq-yv))
+                                   (equal-transitive
+                                    T2
+                                    (f xv)
+                                    (f yv)
+                                    (g yv)
+                                    (ap T1 T2 f xv yv xv-eq-yv)
+                                    (f-ht-g yv))))))
+                               (dlm (is xxx T1)
+                                (refl
+                                 (equal T2 (f xxx) (g xxx))
+                                 (ind-equal
+                                  T2
+                                  (dlm (is fxxx T2)
+                                   (dlm (is gxxx T2)
+                                    (dlm (is fxxx-eq-gxxx (equal T2 fxxx gxxx))
+                                         (equal T2 fxxx gxxx))))
+                                  (dlm (is fxxx T2)
+                                   (refl T2 fxxx))
+                                  (f xxx)
+                                  (g xxx)
+                                  (f-ht-g xxx))))
+                               x
+                               y
+                               x-eq-y)))
+#+end_src
+
+***** f ~ f . id ~ id . f
+#+begin_src lisp
+  (env-define-checked default-env 'ht-id-left
+                      :type
+                      (forall
+                       '((T1 U) (T2 U) (f (fn T1 T2)))
+  
+                       '(homotopy T1 T2 f (compose T1 T2 T2 (id T2) f)))
+                      :value
+                      (given
+                       '((T1 U) (T2 U) (f (fn T1 T2)) (x T1))
+  
+                       '(refl T2 (f x))))
+  
+  (env-define-checked default-env 'ht-id-right
+                      :type
+                      (forall
+                       '((T1 U) (T2 U) (f (fn T1 T2)))
+  
+                       '(homotopy T1 T2 f (compose T1 T1 T2 f (id T1))))
+                      :value
+                      (given
+                       '((T1 U) (T2 U) (f (fn T1 T2)) (x T1))
+  
+                       '(refl T2 (f x))))
+#+end_src
+
+***** f ~ g -> h . f ~ h . g and f . h ~ g . h
+
+#+begin_src lisp
+  (env-define-checked default-env 'ht-ap-left
+                      :type
+                      (forall '((T1 U) (T2 U) (T3 U)
+                                (f (fn T1 T2))
+                                (g (fn T1 T2))
+                                (h (fn T2 T3))
+                                (f-ht-g (homotopy T1 T2 f g)))
+                              '(homotopy T1 T3 (compose T1 T2 T3 h f) (compose T1 T2 T3 h g)))
+                      :value
+                      (given '((T1 U) (T2 U) (T3 U)
+                               (f (fn T1 T2))
+                               (g (fn T1 T2))
+                               (h (fn T2 T3))
+                               (f-ht-g (homotopy T1 T2 f g))
+                               (x T1))
+  
+                             '(ap T2 T3 h (f x) (g x) (f-ht-g x))))
+  
+  (env-define-checked default-env 'ht-ap-right
+                      :type
+                      (forall '((T1 U) (T2 U) (T3 U)
+                                (f (fn T2 T3))
+                                (g (fn T2 T3))
+                                (h (fn T1 T2))
+                                (f-ht-g (homotopy T2 T3 f g)))
+                              '(homotopy T1 T3 (compose T1 T2 T3 f h) (compose T1 T2 T3 g h)))
+                      :value
+                      (given '((T1 U) (T2 U) (T3 U)
+                               (f (fn T2 T3))
+                               (g (fn T2 T3))
+                               (h (fn T1 T2))
+                               (f-ht-g (homotopy T2 T3 f g))
+                               (x T1))
+  
+                             '(f-ht-g (h x))))
+#+end_src
+
+***** Associativity of function composition under homotopy
+This theorem directly follows from the computation rules of functions (roughly, beta-reduction).
+
+#+begin_src lisp
+  (env-define-checked default-env 'compose-assoc-ht
+                      :type
+                      (forall '((T1 U) (T2 U) (T3 U) (T4 U)
+                                (f (fn T3 T4))
+                                (g (fn T2 T3))
+                                (h (fn T1 T2)))
+                              '(homotopy T1 T4
+                                (compose T1 T3 T4 f (compose T1 T2 T3 g h))
+                                (compose T1 T2 T4 (compose T2 T3 T4 f g) h)))
+                      :value
+                      (given '((T1 U) (T2 U) (T3 U) (T4 U)
+                               (f (fn T3 T4))
+                               (g (fn T2 T3))
+                               (h (fn T1 T2))
+                               (x T1))
+                             '(refl T4 (f (g (h x))))))
+#+end_src
+
+**** Quasi-inverse
+#+begin_src lisp
+  (env-define default-env 'qinv
+              :value '(dlm (is T1 U)
+                       (dlm (is T2 U)
+                        (dlm (is f (fn T1 T2))
+                         (dpr (is g (fn T2 T1))
+                          (pr
+                           (homotopy T1 T1
+                            (lam (is x T1) (g (f x)))
+                            (id T1))
+                           (homotopy T2 T2
+                            (lam (is x T2) (f (g x)))
+                            (id T2))))))))
+  
+#+end_src
+
+**** Equivalences
+***** Definition
+#+begin_src lisp
+  (env-define default-env 'isequiv :value
+              '(lam (is T1 U)
+                (lam (is T2 U)
+                 (lam (is f (fn T1 T2))
+                  (pr
+                   (dpr (is g (fn T2 T1)) (homotopy T2 T2 (lam (is x T2) (f (g x))) (id T2)))
+                   (dpr (is h (fn T2 T1)) (homotopy T1 T1 (lam (is x T1) (h (f x))) (id T1))))))))
+  
+  ; 2.4.11
+  (env-define default-env 'equiv :value
+              '(lam (is T1 U) (lam (is T2 U) (dpr (is f (fn T1 T2)) (isequiv T1 T2 f)))))
+#+end_src
+
+
+***** Properties (as theorems)
+****** qinv f -> isequiv f
+#+begin_src lisp
+  (env-define-checked default-env 'qinv-to-isequiv
+                      :type (forall
+                             '((T1 U) (T2 U) (f (fn T1 T2)))
+  
+                             '(fn
+                               (qinv T1 T2 f)
+                               (isequiv T1 T2 f)))
+  
+                      :value (given
+                              '((T1 U) (T2 U) (f (fn T1 T2)))
+  
+                              '((lam (is gf-ht-id (fn (fn T2 T1) U))
+                                 ((lam (is fg-ht-id (fn (fn T2 T1) U))
+                                    (ind-dpr
+                                     (fn T2 T1)
+                                     (lam (is g (fn T2 T1)) (pr (gf-ht-id g) (fg-ht-id g)))
+                                     (lam (is dp (qinv T1 T2 f)) (isequiv T1 T2 f))
+                                     (dlm (is gval (fn T2 T1))
+                                      (dlm (is hts (pr (gf-ht-id gval) (fg-ht-id gval)))
+                                           (pair
+                                            (pair gval (cdr (gf-ht-id gval) (fg-ht-id gval) hts))
+                                            (pair gval (car (gf-ht-id gval) (fg-ht-id gval) hts)))))))
+                                  (lam (is g (fn T2 T1))
+                                   (homotopy T2 T2
+                                    (lam (is x T2) (f (g x)))
+                                    (id T2)))))
+                                (lam (is g (fn T2 T1))
+                                 (homotopy T1 T1
+                                  (lam (is x T1) (g (f x)))
+                                  (id T1))))))
+#+end_src
+
+****** isequiv f -> qinv f
+#+begin_src lisp
+  (env-define-checked
+   default-env 'isequiv-to-qinv
+   :type (forall
+          '((T1 U) (T2 U) (f (fn T1 T2)))
+
+          '(fn
+            (isequiv T1 T2 f)
+            (qinv T1 T2 f)))
+   :value (given
+           '((T1 U) (T2 U) (f (fn T1 T2)))
+           '((lam (is hf-ht-id (fn (fn T2 T1) U))
+              ((lam (is fg-ht-id (fn (fn T2 T1) U))
+                (lam (is eq (isequiv T1 T2 f))
+                 (ind-pr
+                  (dpr (is g (fn T2 T1)) (fg-ht-id g))
+                  (dpr (is h (fn T2 T1)) (hf-ht-id h))
+                  (lam (is hyp (pr
+                                (dpr (is g (fn T2 T1)) (fg-ht-id g))
+                                (dpr (is h (fn T2 T1)) (hf-ht-id h))))
+                       (qinv T1 T2 f))
+                  (dlm (is gdpr (dpr (is g (fn T2 T1)) (fg-ht-id g)))
+                       (dlm (is hdpr (dpr (is h (fn T2 T1)) (hf-ht-id h)))
+                            (ind-dpr
+                             (fn T2 T1)
+                             (lam (is ff (fn T2 T1))
+                                  (fg-ht-id ff))
+                             (dlm (is g-right-inv (dpr (is g (fn T2 T1)) (fg-ht-id g)))
+                                  (qinv T1 T2 f))
+                             (dlm (is gval (fn T2 T1))
+                                  (dlm (is p-fg-ht-id (fg-ht-id gval))
+                                       (ind-dpr
+                                        (fn T2 T1)
+                                        (lam (is ff (fn T2 T1))
+                                             (hf-ht-id ff))
+                                        (dlm (is h-left-inv (dpr (is h (fn T2 T1)) (hf-ht-id h)))
+                                             (qinv T1 T2 f))
+                                        (dlm (is hval (fn T2 T1))
+                                             (dlm (is p-hf-ht-id (hf-ht-id hval))
+                                                  (pair
+                                                   (compose T2 T1 T1 (compose T1 T2 T1 hval f) gval)
+                                                   (pair
+
+                                                    (homotopy-transitive
+                                                     T1 T1
+                                                     (compose
+                                                      T1 T2 T1
+                                                      (compose
+                                                       T2 T1 T1
+                                                       (compose T1 T2 T1 hval f)
+                                                       gval)
+                                                      f)
+                                                     (compose T1 T2 T1 hval f)
+                                                     (id T1)
+                                                     (ht-ap-right
+                                                      T1 T2 T1
+                                                      (compose T2 T1 T1 (compose T1 T2 T1 hval f) gval)
+                                                      hval
+                                                      f
+                                                      (homotopy-transitive
+                                                       T2 T1
+                                                       (compose T2 T1 T1 (compose T1 T2 T1 hval f) gval)
+                                                       (compose T2 T2 T1 hval (compose T2 T1 T2 f gval))
+                                                       hval
+                                                       (homotopy-symmetric
+                                                        T2 T1
+                                                        (compose T2 T2 T1 hval (compose T2 T1 T2 f gval))
+                                                        (compose T2 T1 T1 (compose T1 T2 T1 hval f) gval)
+                                                        (compose-assoc-ht T2 T1 T2 T1 hval f gval))
+                                                       (homotopy-transitive
+                                                        T2 T1
+                                                        (compose T2 T2 T1 hval (compose T2 T1 T2 f gval))
+                                                        (compose T2 T2 T1 hval (id T2))
+                                                        hval
+                                                        (ht-ap-left
+                                                         T2 T2 T1
+                                                         (compose T2 T1 T2 f gval)
+                                                         (id T2)
+                                                         hval
+                                                         (fg-ht-id gval))
+                                                        (ht-id-right T2 T1 hval))))
+                                                     p-hf-ht-id)
+
+                                                    (homotopy-transitive
+                                                     T2 T2
+                                                     (compose T2 T1 T2 f (compose T2 T1 T1
+                                                                                  (compose T1 T2 T1 hval f)
+                                                                                  gval))
+                                                     (compose T2 T1 T2 f gval)
+                                                     (id T2)
+                                                     (ht-ap-left
+                                                      T2
+                                                      T1
+                                                      T2
+                                                      (compose T2 T1 T1 (compose T1 T2 T1 hval f) gval)
+                                                      gval
+                                                      f
+                                                      (homotopy-transitive
+                                                       T2 T1
+                                                       (compose T2 T1 T1 (compose T1 T2 T1 hval f) gval)
+                                                       (compose T2 T1 T1 (id T1) gval)
+                                                       gval
+                                                       (ht-ap-right T2 T1 T1
+                                                                    (compose T1 T2 T1 hval f)
+                                                                    (id T1)
+                                                                    gval
+                                                                    p-hf-ht-id)
+                                                       (homotopy-symmetric
+                                                        T2 T1
+                                                        gval
+                                                        (compose T2 T1 T1 (id T1) gval)
+                                                        (ht-id-left T2 T1 gval))))
+                                                     p-fg-ht-id)))))
+                                        hdpr)))
+                             gdpr)))
+                  eq)))
+               (lam (is g (fn T2 T1)) (homotopy T2 T2 (lam (is x T2) (f (g x))) (id T2)))))
+             (lam (is h (fn T2 T1)) (homotopy T1 T1 (lam (is x T1) (h (f x))) (id T1))))))
+#+end_src
+
+****** forall A equiv A A
+#+begin_src lisp
+  (env-define-checked default-env 'equiv-reflexive
+                      :type
+                      (forall '((A U))
+                              '(equiv A A))
+                      :value
+                      (given '((A U))
+                             '(pair
+                               (id A)
+                               (pair
+                                (pair (id A) (ht-id-right A A (id A)))
+                                (pair (id A) (ht-id-left A A (id A)))))))
+#+end_src
+
+** The naturals
+*** Definition
+#+begin_src lisp
+(env-set default-env :type 'N 'U)
+#+end_src
+
+#+begin_src lisp
+  (env-define default-env 'z :type 'N :value 'z)
+  (env-define default-env 'succ :type '(fn N N) :value 'succ)
+  (env-define default-env 'n1 :type 'N :value '(succ z))
+  (env-define default-env 'n2 :type 'N :value '(succ n1))
+  (env-define default-env 'n3 :type 'N :value '(succ n2))
+  (env-define default-env 'n4 :type 'N :value '(succ n3))
+  (env-define default-env 'n5 :type 'N :value '(succ n4))
+#+end_src
+
+*** Recursor
+#+begin_src lisp
+  (env-define-checked default-env 'rec-nat
+                      :type '(dfn (is C U)
+                              (fn C (fn (fn N (fn C C)) (fn N C))))
+                      :value '(dlm (is C U)
+                               (lam (is c0 C)
+                                (lam (is cs (fn N (fn C C)))
+                                 (lam (is x N)
+                                      (match N C x ((&literal succ) xp)
+                                        (cs xp (rec-nat C c0 cs xp))
+                                        c0))))))
+  
+#+end_src
+
+*** Inductor
+#+begin_src lisp
+  (env-define-checked default-env 'ind-nat
+                      :type '(dfn (is C (fn N U))
+                              (fn
+                               (C z)
+                               (fn
+                                (dfn (is x N) (fn (C x) (C (succ x))))
+                                (dfn (is x N) (C x)))))
+                      :value '(dlm (is C (fn N U))
+                               (lam (is bc (C z))
+                                (lam (is isucc (dfn (is x N) (fn (C x) (C (succ x)))))
+                                 (dlm (is x N)
+                                      (match N U x ((&literal succ) xp)
+                                        (isucc xp (ind-nat C bc isucc xp))
+                                        bc))))))
+
+#+end_src
+
+*** Addition
+#+begin_src lisp
+  (env-define-checked default-env 'nat-add-rec
+                      :type '(fn N (fn N N))
+                      :value '(rec-nat
+                               (fn N N)
+                               (lam (is xx N) xx)
+                               (lam (is xx N)
+                                (lam (is f (fn N N))
+                                 (lam (is y N)
+                                      (f (succ y)))))))
+#+end_src
+
+**** Axioms
+I have no idea how to prove these with this crappy system I've
+made. It's a very obvious fact they follow from simple beta-reduction,
+but the system gets very confused because ~nat-add-rec~ is defined in
+terms of the recursor. So, I'll just use the undefined (but still of
+type ~(fn N (fn N N))~) ~nat-add~ and manually define the axioms. We
+can always assume a path fom ~(nat-add x y)~ to ~(nat-add-rec x y)~
+but to do that we need to be absolutely sure that these axioms are
+consistent and make sense for the naturals.
+
+#+begin_src lisp
+  (env-define default-env 'nat-add
+              :type '(fn N (fn N N))
+              :value 'nat-add)
+#+end_src
+
+***** 0 + x = x + 0 = x
+#+begin_src lisp
+  (env-define default-env 'nat-add-1-z-id
+              :type
+              (forall '((x N))
+                      '(equal N (nat-add z x) x))
+              :value 'nat-add-1-z-id)
+
+  (env-define default-env 'nat-add-2-z-id
+              :type
+              (forall '((x N))
+                      '(equal N (nat-add x z) x))
+              :value 'nat-add-2-z-id)
+#+end_src
+
+***** x + (y + 1) = (x + 1) + y = (x + y) + 1
+#+begin_src lisp
+  (env-define default-env 'nat-add-1-comm-succ
+                      :type
+                      (forall '((x N) (y N))
+                              '(equal N (nat-add (succ x) y) (succ (nat-add x y))))
+                      :value 'nat-add-1-comm-succ)
+  
+  (env-define default-env 'nat-add-2-comm-succ
+                      :type
+                      (forall '((x N) (y N))
+                              '(equal N (nat-add x (succ y)) (succ (nat-add x y))))
+                      :value 'nat-add-2-comm-succ)
+  
+#+end_src
+
+**** Theorems
+***** Simple corollaries of the axioms
+****** Path inversions of ~nat-add-?-comm-succ~.
+#+begin_src lisp
+  (env-define-checked default-env 'nat-add-1-comm-succ-rev
+                      :type
+                      (forall '((x N) (y N))
+                              '(equal N (succ (nat-add x y)) (nat-add (succ x) y)))
+                      :value
+                      (given '((x N) (y N))
+                             '(equal-symmetric
+                               N
+                               (nat-add (succ x) y)
+                               (succ (nat-add x y))
+                               (nat-add-1-comm-succ x y))))
+  
+  (env-define-checked default-env 'nat-add-2-comm-succ-rev
+                      :type
+                      (forall '((x N) (y N))
+                              '(equal N (succ (nat-add x y)) (nat-add x (succ y))))
+                      :value
+                      (given '((x N) (y N))
+                             '(equal-symmetric
+                               N
+                               (nat-add x (succ y))
+                               (succ (nat-add x y))
+                               (nat-add-2-comm-succ x y))))
+#+end_src
+
+****** Path inversions of ~nat-add-?-z-id~
+#+begin_src lisp
+  (env-define-checked default-env 'nat-add-1-z-id-rev
+                      :type
+                      (forall '((x N))
+                              '(equal N x (nat-add z x)))
+                      :value
+                      (given '((x N))
+                             '(equal-symmetric N (nat-add z x) x (nat-add-1-z-id x))))
+
+  (env-define-checked default-env 'nat-add-2-z-id-rev
+                      :type
+                      (forall '((x N))
+                              '(equal N x (nat-add x z)))
+                      :value
+                      (given '((x N))
+                             '(equal-symmetric N (nat-add x z) x (nat-add-2-z-id x))))
+#+end_src
+
+***** Associativity of addition
+#+begin_src lisp
+  (env-define-checked
+   default-env
+   'nat-add-assoc
+   :type (forall
+          '((x1 N) (x2 N) (x3 N))
+  
+          '(equal N
+            (nat-add (nat-add x1 x2) x3)
+            (nat-add x1 (nat-add x2 x3))))
+  
+   :value (given
+           '((x1 N) (x2 N) (x3 N))
+  
+           '(ind-nat
+             (lam (is x3v N)
+              (equal N
+               (nat-add (nat-add x1 x2) x3v)
+               (nat-add x1 (nat-add x2 x3v))))
+             (equal-transitive N
+              (nat-add (nat-add x1 x2) z)
+              (nat-add x1 x2)
+              (nat-add x1 (nat-add x2 z))
+              (nat-add-2-z-id (nat-add x1 x2))
+              (ap N N (lam (is value N) (nat-add x1 value))
+               x2
+               (nat-add x2 z)
+               (nat-add-2-z-id-rev x2)))
+             (dlm (is x3v N)
+              (lam (is hyp (equal
+                            N
+                            (nat-add (nat-add x1 x2) x3v)
+                            (nat-add x1 (nat-add x2 x3v))))
+               (equal-transitive
+                N
+                (nat-add (nat-add x1 x2) (succ x3v))
+                (succ (nat-add x1 (nat-add x2 x3v)))
+                (nat-add x1 (nat-add x2 (succ x3v)))
+                (equal-transitive
+                 N
+                 (nat-add (nat-add x1 x2) (succ x3v))
+                 (succ (nat-add (nat-add x1 x2) x3v))
+                 (succ (nat-add x1 (nat-add x2 x3v)))
+                 (nat-add-2-comm-succ (nat-add x1 x2) x3v)
+                 (ap N N succ
+                     (nat-add (nat-add x1 x2) x3v)
+                     (nat-add x1 (nat-add x2 x3v))
+                     hyp))
+                (equal-transitive
+                 N
+                 (succ (nat-add x1 (nat-add x2 x3v)))
+                 (nat-add x1 (succ (nat-add x2 x3v)))
+                 (nat-add x1 (nat-add x2 (succ x3v)))
+                 (nat-add-2-comm-succ-rev x1 (nat-add x2 x3v))
+                 (ap N N (lam (is value N) (nat-add x1 value))
+                     (succ (nat-add x2 x3v))
+                     (nat-add x2 (succ x3v))
+                     (nat-add-2-comm-succ-rev x2 x3v))))))
+             x3)))
+  
+  (env-define-checked
+   default-env
+   'nat-add-assoc-rev
+   :type (forall
+          '((x1 N) (x2 N) (x3 N))
+  
+          '(equal N
+            (nat-add x1 (nat-add x2 x3))
+            (nat-add (nat-add x1 x2) x3)))
+   :value (given
+           '((x1 N) (x2 N) (x3 N))
+           '(equal-symmetric
+             N
+             (nat-add (nat-add x1 x2) x3)
+             (nat-add x1 (nat-add x2 x3))
+             (nat-add-assoc x1 x2 x3))))
+  
+#+end_src
+
+***** Commutativity of addition
+#+begin_src lisp
+  (env-define-checked
+   default-env
+   'nat-add-comm
+   :type (forall
+          '((x1 N) (x2 N))
+  
+          '(equal N (nat-add x1 x2) (nat-add x2 x1)))
+  
+   :value (given
+           '((x1 N) (x2 N))
+  
+           '(ind-nat
+             (lam (is x2v N) (equal N (nat-add x1 x2v) (nat-add x2v x1)))
+             (equal-transitive N
+              (nat-add x1 z)
+              x1
+              (nat-add z x1)
+              (nat-add-2-z-id x1)
+              (nat-add-1-z-id-rev x1))
+             (dlm (is x2v N)
+              (lam (is hyp (equal N (nat-add x1 x2v) (nat-add x2v x1)))
+               (equal-transitive
+                N
+                (nat-add x1 (succ x2v))
+                (succ (nat-add x2v x1))
+                (nat-add (succ x2v) x1)
+                (equal-transitive
+                 N
+                 (nat-add x1 (succ x2v))
+                 (succ (nat-add x1 x2v))
+                 (succ (nat-add x2v x1))
+                 (nat-add-2-comm-succ x1 x2v)
+                 (ap N N succ (nat-add x1 x2v) (nat-add x2v x1) hyp))
+                (nat-add-1-comm-succ-rev x2v x1))))
+             x2)))
+#+end_src
+
+*** Multiplication
+TODO: recursive definition
+
+**** Axioms
+Similarly to addition, we'll define proof-relevant multiplication
+via its paths.
+
+#+begin_src lisp
+  (env-define default-env 'nat-mul
+              :type '(fn N (fn N N))
+              :value 'nat-mul)
+#+end_src
+
+***** 0 * x = x * 0 = 0
+
+#+begin_src lisp
+  (env-define default-env 'nat-mul-1-z-z
+              :type (forall '((x N))
+                            '(equal N (nat-mul z x) z))
+              :value 'nat-mul-1-z-z)
+
+  (env-define default-env 'nat-mul-2-z-z
+              :type (forall '((x N))
+                            '(equal N (nat-mul x z) z))
+              :value 'nat-mul-2-z-z)
+#+end_src
+
+***** (x + 1) * y = x * y + y and x * (y + 1) = x * y + x
+#+begin_src lisp
+  (env-define default-env 'nat-mul-1-succ-distr
+              :type (forall '((x N) (y N))
+                            '(equal N (nat-mul (succ x) y) (nat-add (nat-mul x y) y)))
+              :value 'nat-mul-1-succ-distr)
+  
+  (env-define default-env 'nat-mul-2-succ-distr
+              :type (forall '((x N) (y N))
+                            '(equal N (nat-mul x (succ y)) (nat-add (nat-mul x y) x)))
+              :value 'nat-mul-2-succ-distr)
+#+end_src
+
+**** Theorems
+***** Simple corollary of the axioms
+#+begin_src lisp
+  (env-define-checked default-env 'nat-mul-1-z-z-rev
+                      :type (forall '((x N))
+                                    '(equal N z (nat-mul z x)))
+                      :value (given '((x N))
+                                    '(equal-symmetric N (nat-mul z x) z (nat-mul-1-z-z x))))
+  
+  (env-define-checked default-env 'nat-mul-2-z-z-rev
+                      :type (forall '((x N))
+                                    '(equal N z (nat-mul x z)))
+                      :value (given '((x N))
+                                    '(equal-symmetric N (nat-mul x z) z (nat-mul-2-z-z x))))
+  
+  (env-define-checked default-env 'nat-mul-1-succ-distr-rev
+                      :type (forall '((x N) (y N))
+                                    '(equal N (nat-add (nat-mul x y) y) (nat-mul (succ x) y)))
+                      :value (given '((x N) (y N))
+                                    '(equal-symmetric
+                                      N
+                                      (nat-mul (succ x) y)
+                                      (nat-add (nat-mul x y) y)
+                                      (nat-mul-1-succ-distr x y))))
+  
+  (env-define-checked default-env 'nat-mul-2-succ-distr-rev
+                      :type (forall '((x N) (y N))
+                                    '(equal N (nat-add (nat-mul x y) x) (nat-mul x (succ y))))
+                      :value (given '((x N) (y N))
+                                    '(equal-symmetric
+                                      N
+                                      (nat-mul x (succ y))
+                                      (nat-add (nat-mul x y) x)
+                                      (nat-mul-2-succ-distr x y))))
+#+end_src
+
+***** Commutativity of multiplication
+#+begin_src lisp
+  (env-define-checked
+   default-env
+   'nat-mul-comm
+   :type (forall
+          '((x1 N) (x2 N))
+  
+          '(equal N (nat-mul x1 x2) (nat-mul x2 x1)))
+   :value (given
+           '((x1 N) (x2 N))
+  
+           '(ind-nat
+             (lam (is x2v N) (equal N (nat-mul x1 x2v) (nat-mul x2v x1)))
+             (equal-transitive
+              N
+              (nat-mul x1 z)
+              z
+              (nat-mul z x1)
+              (nat-mul-2-z-z x1)
+              (nat-mul-1-z-z-rev x1))
+             (dlm (is x2v N)
+              (lam (is hyp (equal N (nat-mul x1 x2v) (nat-mul x2v x1)))
+               (equal-chain
+                N
+                (nat-mul x1 (succ x2v))
+                ((nat-add (nat-mul x1 x2v) x1)
+                 (nat-mul-2-succ-distr x1 x2v))
+                ((nat-add (nat-mul x2v x1) x1)
+                 (ap N N
+                     (lam (is value N) (nat-add value x1))
+                     (nat-mul x1 x2v)
+                     (nat-mul x2v x1)
+                     hyp))
+                ((nat-mul (succ x2v) x1)
+                 (nat-mul-1-succ-distr-rev x2v x1)))))
+             x2)))
+#+end_src
+
+***** Distributivity of multiplication over addition
+#+begin_src lisp
+  (env-define-checked
+   default-env
+   'nat-mul-1-add-distr
+   :type (forall
+          '((x1 N) (x2 N) (x3 N))
+  
+          '(equal N
+            (nat-mul (nat-add x1 x2) x3)
+            (nat-add (nat-mul x1 x3) (nat-mul x2 x3))))
+  
+   :value (given
+           '((x1 N) (x2 N) (x3 N))
+  
+           '(ind-nat
+             (lam (is x3v N) (equal N
+                              (nat-mul (nat-add x1 x2) x3v)
+                              (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v))))
+             (equal-chain
+              N
+              (nat-mul (nat-add x1 x2) z)
+              (z (nat-mul-2-z-z (nat-add x1 x2)))
+              ((nat-add z z) (nat-add-1-z-id-rev z))
+              ((nat-add z (nat-mul x2 z))
+               (ap N N
+                   (lam (is value N) (nat-add z value))
+                   z
+                   (nat-mul x2 z)
+                   (nat-mul-2-z-z-rev x2)))
+              ((nat-add (nat-mul x1 z) (nat-mul x2 z))
+               (ap N N
+                   (lam (is value N) (nat-add value (nat-mul x2 z)))
+                   z
+                   (nat-mul x1 z)
+                   (nat-mul-2-z-z-rev x1))))
+             (dlm (is x3v N)
+              (lam (is hyp (equal N
+                                  (nat-mul (nat-add x1 x2) x3v)
+                                  (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v))))
+               (equal-chain
+                N
+                (nat-mul (nat-add x1 x2) (succ x3v))
+                ((nat-add (nat-mul (nat-add x1 x2) x3v) (nat-add x1 x2))
+                 (nat-mul-2-succ-distr (nat-add x1 x2) x3v))
+                ((nat-add (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v)) (nat-add x1 x2))
+                 (ap N N
+                     (lam (is value N) (nat-add value (nat-add x1 x2)))
+                     (nat-mul (nat-add x1 x2) x3v)
+                     (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v))
+                     hyp))
+                ((nat-add (nat-add (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v)) x1) x2)
+                 (nat-add-assoc-rev (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v)) x1 x2))
+                ((nat-add (nat-add x1 (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v))) x2)
+                 (ap N N
+                     (lam (is value N) (nat-add value x2))
+                     (nat-add (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v)) x1)
+                     (nat-add x1 (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v)))
+                     (nat-add-comm (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v)) x1)))
+                ((nat-add (nat-add (nat-add x1 (nat-mul x1 x3v)) (nat-mul x2 x3v)) x2)
+                 (ap N N
+                     (lam (is value N) (nat-add value x2))
+                     (nat-add x1 (nat-add (nat-mul x1 x3v) (nat-mul x2 x3v)))
+                     (nat-add (nat-add x1 (nat-mul x1 x3v)) (nat-mul x2 x3v))
+                     (nat-add-assoc-rev x1 (nat-mul x1 x3v) (nat-mul x2 x3v))))
+                ((nat-add (nat-add (nat-mul x1 (succ x3v)) (nat-mul x2 x3v)) x2)
+                 (ap N N
+                         (lam (is value N) (nat-add (nat-add value (nat-mul x2 x3v)) x2))
+                         (nat-add x1 (nat-mul x1 x3v))
+                         (nat-mul x1 (succ x3v))
+                         (equal-transitive
+                          N
+                          (nat-add x1 (nat-mul x1 x3v))
+                          (nat-add (nat-mul x1 x3v) x1)
+                          (nat-mul x1 (succ x3v))
+                          (nat-add-comm x1 (nat-mul x1 x3v))
+                          (nat-mul-2-succ-distr-rev x1 x3v))))
+                ((nat-add (nat-mul x1 (succ x3v)) (nat-add (nat-mul x2 x3v) x2))
+                 (nat-add-assoc (nat-mul x1 (succ x3v)) (nat-mul x2 x3v) x2))
+                ((nat-add (nat-mul x1 (succ x3v)) (nat-mul x2 (succ x3v)))
+                 (ap N N
+                     (lam (is value N) (nat-add (nat-mul x1 (succ x3v)) value))
+                     (nat-add (nat-mul x2 x3v) x2)
+                     (nat-mul x2 (succ x3v))
+                     (nat-mul-2-succ-distr-rev x2 x3v))))))
+             x3)))
+  
+  
+  (env-define-checked
+   default-env
+   'nat-mul-1-add-distr-rev
+   :type (forall
+          '((x1 N) (x2 N) (x3 N))
+  
+          '(equal N
+            (nat-add (nat-mul x1 x3) (nat-mul x2 x3))
+            (nat-mul (nat-add x1 x2) x3)))
+  
+   :value (given
+           '((x1 N) (x2 N) (x3 N))
+  
+           '(equal-symmetric
+             N
+             (nat-mul (nat-add x1 x2) x3)
+             (nat-add (nat-mul x1 x3) (nat-mul x2 x3))
+             (nat-mul-1-add-distr x1 x2 x3))))
+  
+  (env-define-checked
+   default-env
+   'nat-mul-1-add-distr-rev-flipped
+   :type (forall
+          '((x1 N) (x2 N) (x3 N))
+  
+          '(equal N
+            (nat-add (nat-mul x3 x1) (nat-mul x3 x2))
+            (nat-mul (nat-add x1 x2) x3)))
+  
+   :value (given
+           '((x1 N) (x2 N) (x3 N))
+  
+           '(equal-chain
+             N
+             (nat-add (nat-mul x3 x1) (nat-mul x3 x2))
+             ((nat-add (nat-mul x1 x3) (nat-mul x3 x2))
+              (ap N N
+              (lam (is value N) (nat-add value (nat-mul x3 x2)))
+              (nat-mul x3 x1)
+              (nat-mul x1 x3)
+              (nat-mul-comm x3 x1))
+              )
+             ((nat-add (nat-mul x1 x3) (nat-mul x2 x3))
+              (ap N N
+               (lam (is value N) (nat-add (nat-mul x1 x3) value))
+               (nat-mul x3 x2)
+               (nat-mul x2 x3)
+               (nat-mul-comm x3 x2)))
+             ((nat-mul (nat-add x1 x2) x3)
+              (equal-symmetric
+               N
+               (nat-mul (nat-add x1 x2) x3)
+               (nat-add (nat-mul x1 x3) (nat-mul x2 x3))
+               (nat-mul-1-add-distr x1 x2 x3))))))
+#+end_src
+
+***** Associativity of multiplication
+#+begin_src lisp
+  (env-define-checked
+   default-env
+   'nat-mul-assoc
+   :type (forall
+          '((x1 N) (x2 N) (x3 N))
+  
+          '(equal N
+            (nat-mul (nat-mul x1 x2) x3)
+            (nat-mul x1 (nat-mul x2 x3))))
+  
+   :value (given
+           '((x1 N) (x2 N) (x3 N))
+  
+           '(ind-nat
+             (lam (is x3v N)
+              (equal N
+               (nat-mul (nat-mul x1 x2) x3v)
+               (nat-mul x1 (nat-mul x2 x3v))))
+             (equal-chain
+              N
+              (nat-mul (nat-mul x1 x2) z)
+              (z
+               (nat-mul-2-z-z (nat-mul x1 x2)))
+              ((nat-mul x1 z)
+               (nat-mul-2-z-z-rev x1))
+              ((nat-mul x1 (nat-mul x2 z))
+               (ap N N
+                   (lam (is value N) (nat-mul x1 value))
+                   z
+                   (nat-mul x2 z)
+                   (nat-mul-2-z-z-rev x2))))
+             (dlm (is x3v N)
+              (lam (is hyp (equal N
+                                  (nat-mul (nat-mul x1 x2) x3v)
+                                  (nat-mul x1 (nat-mul x2 x3v))))
+               (equal-chain
+                N
+                (nat-mul (nat-mul x1 x2) (succ x3v))
+  
+                ((nat-add (nat-mul (nat-mul x1 x2) x3v) (nat-mul x1 x2))
+                 (nat-mul-2-succ-distr (nat-mul x1 x2) x3v))
+                ((nat-add (nat-mul x1 (nat-mul x2 x3v)) (nat-mul x1 x2))
+                 (ap N N
+                     (lam (is value N) (nat-add value (nat-mul x1 x2)))
+                     (nat-mul (nat-mul x1 x2) x3v)
+                     (nat-mul x1 (nat-mul x2 x3v))
+                     hyp))
+                ((nat-mul (nat-add (nat-mul x2 x3v) x2) x1)
+                 (nat-mul-1-add-distr-rev-flipped (nat-mul x2 x3v) x2 x1))
+                ((nat-mul x1 (nat-add (nat-mul x2 x3v) x2))
+                 (nat-mul-comm (nat-add (nat-mul x2 x3v) x2) x1))
+                ((nat-mul x1 (nat-mul x2 (succ x3v)))
+                 (ap N N
+                     (lam (is value N) (nat-mul x1 value))
+                     (nat-add (nat-mul x2 x3v) x2)
+                     (nat-mul x2 (succ x3v))
+                     (nat-mul-2-succ-distr-rev x2 x3v))))))
+             x3)))
+#+end_src
+
+*** Relations
+**** >=
+#+begin_src lisp
+  (env-define default-env 'N-ge
+              :value '(lam (is x N)
+                       (lam (is y N)
+                        (dpr (is diff N)
+                         (equal N x (nat-add y diff))))))
+#+end_src
+
+
+
+
+** Higher inductive types
+A feeble attempt.
+
+*** The Interval
+#+begin_src lisp
+  (env-define default-env 'Inter
+              :type 'U
+              :value 'Inter)
+  
+  (env-define default-env 'inter-0
+              :type 'Inter
+              :value 'inter-0)
+  (env-define default-env 'inter-1
+              :type 'Inter
+              :value 'inter-1)
+  
+  (env-define default-env 'inter-seg
+              :type '(equal Inter inter-0 inter-1)
+              :value 'inter-seg)
+  
+#+end_src
+
+**** Induction principle
+
+#+begin_src lisp
+  (let ((common-params '((C (fn Inter U))
+                         (b0 (C inter-0))
+                         (b1 (C inter-1))
+                         (bseg (equal (C inter-1) (transport Inter C inter-0 inter-1 inter-seg b0) b1)))))
+  
+    (env-define-checked default-env 'ind-inter
+                        :type (forall (append common-params '((x Inter)))
+                                      '(C x))
+  
+                        :value (given (append common-params '((x Inter)))
+                                      '(match Inter (C x) x
+                                        (&literal inter-0) b0
+                                        (match Inter (C x) x
+                                          (&literal inter-1) b1
+                                          !bail))))
+  
+    (env-define default-env 'ind-inter-seg
+                :type (forall common-params
+                              '(equal
+                                (equal (C inter-1) (transport Inter C inter-0 inter-1 inter-seg b0) b1)
+                                (apd Inter C (ind-inter C b0 b1 bseg) inter-0 inter-1 inter-seg)
+                                bseg))
+                :value 'ind-inter-seg))
+#+end_src
+
+**** Proof of function extensionality
+
+Uses eta-equivalence.
+
+#+begin_src lisp
+  (env-define-checked default-env 'inter-funext
+                      :type (forall '((T1 U)
+                                      (T2 U)
+                                      (f (fn T1 T2))
+                                      (g (fn T1 T2)))
+                                    '(fn
+                                      (homotopy T1 T2 f g)
+                                      (equal (fn T1 T2) f g)))
+                      :value (given '((T1 U)
+                                      (T2 U)
+                                      (f (fn T1 T2))
+                                      (g (fn T1 T2)))
+                                    '(lam (is f-ht-g (homotopy T1 T2 f g))
+                                      (ap Inter (fn T1 T2) 
+                                       (lam (is x Inter)
+                                        (lam (is v T1)
+                                         (ind-inter
+                                          (lam (is xx Inter) T2)
+                                          (f v)
+                                          (g v)
+                                          (f-ht-g v)
+                                          x)))
+                                       inter-0
+                                       inter-1
+                                       inter-seg))))
+#+end_src
