@@ -189,7 +189,7 @@ print statements all over the place and toggle them with a macro.
     (let* ((type-reduced (env-reduce env type))
            (value-reduced (env-reduce env value))
            (value-type (env-deduce-type env value-reduced)))
-      (env-type-check env type value-type)
+      (env-type-check env type-reduced value-type)
       (env-define env name :type type :value value)
       t))
   
