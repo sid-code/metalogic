@@ -139,23 +139,23 @@ print statements all over the place and toggle them with a macro.
     (equiv-rules (make-hash-table))
     (deduction-rules (make-hash-table))
     (reduction-rules (make-hash-table))
-  
+
     (deduction-cache (make-hash-table))
     (reduction-cache (make-hash-table)))
-  
+
   (defun env-drop-caches (env)
     (setf (env-deduction-cache env) (make-hash-table))
     (setf (env-reduction-cache env) (make-hash-table)))
-  
+
   (defun env-has-definition (env sym)
     (or (env-get env :value sym) (env-get env :type sym)))
-  
+
   (defun env-gen-sym (env base &key (banned '()))
     (loop for i from 1 to 1000
           for sym = (intern (concatenate 'string (write-to-string base) (write-to-string i)))
           when (not (or (env-get env :type sym) (member sym banned)))
             return sym))
-  
+
   (defun env-get (env loc name)
     (let ((accessor (cond
                       ((eql loc :value) 'env-values)
@@ -167,7 +167,7 @@ print statements all over the place and toggle them with a macro.
       (and env
            (or (gethash name (funcall accessor env))
                (env-get (env-parent env) loc name)))))
-  
+
   (defun env-set (env loc name val)
     (clrhash (env-reduction-cache env))
     (clrhash (env-deduction-cache env))
@@ -180,11 +180,11 @@ print statements all over the place and toggle them with a macro.
       ((eql loc :reduction-rule) (setf (gethash name (env-reduction-rules env)) val))
       ((eql loc :deduction-rule) (setf (gethash name (env-deduction-rules env)) val)))
     env)
-  
+
   (defun env-define (env name &key type value)
     (env-set env :type name type)
     (env-set env :value name value))
-  
+
   (defun env-define-checked (env name &key type value)
     (let* ((type-reduced (env-reduce env type))
            (value-reduced (env-reduce env value))
@@ -192,7 +192,7 @@ print statements all over the place and toggle them with a macro.
       (env-type-check env type-reduced value-type)
       (env-define env name :type type :value value)
       t))
-  
+
   (defun env-apply-bindings (env bindings)
     "For each (KEY . VALUE) entry in alist BINDINGS, define a symbol KEY
     in ENV with value VALUE and type (env-deduce-type ENV VALUE)"
@@ -203,10 +203,10 @@ print statements all over the place and toggle them with a macro.
                        (env-deduce-type env (cdr binding))))
             bindings)
     env)
-  
+
   (defvar default-env (make-env :parent nil))
   (setq default-env (make-env :parent nil))
-  
+
 #+end_src
 
 ** Rules
