@@ -698,7 +698,7 @@ define a special form of ~dlm~:
                                     (pat-unif (unify pat arg-r))
                                     (sub-env (env-apply-bindings (make-env :parent env) pat-unif))
                                     (result-r (env-reduce sub-env result))
-                                    (result-type (env-deduce-type env result-r)))
+                                    (result-type (env-deduce-type sub-env result-r)))
                                (if (env-type-equivalentp env codomain-r result-type)
                                    (intermediate-expression result-r)
                                    (error 'type-mismatch :form form :needed codomain-r :got result-type
