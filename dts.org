@@ -2627,12 +2627,17 @@ via its paths.
 **** >=
 #+begin_src lisp
   (env-define default-env 'N-ge
-              :value '(lam (is x N)
-                       (lam (is y N)
-                        (dpr (is diff N)
-                         (equal N x (nat-add y diff))))))
-#+end_src
+	      :value '(lam (is x N)
+		       (lam (is y N)
+			(dpr (is diff N)
+			 (equal N x (nat-add-rec y diff))))))
 
+
+  (env-define-checked default-env 'n1-ge-z
+		      :type '(N-ge n1 z)
+		      :value '(pair n1 (refl N n1)))
+
+#+end_src
 
 
 
