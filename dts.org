@@ -1189,8 +1189,7 @@ TODO: Recursor and inductor
 #+end_src
 
 *** Recursor
-
-    Can also be defined in terms of projections.
+Can also be defined in terms of projections.
 
 #+begin_src lisp
   (env-define-checked default-env 'rec-pr
