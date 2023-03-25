@@ -870,12 +870,12 @@ concatenation. Without this, long proofs will get nested very deep.
   (defun env-type-equivalentp (env t1 t2)
     (format t "TYPE EQUIVALENTP ~%~a and~%~a~%~%" t1 t2)
     (let ((result (handler-case
-                      (prog2 (env-type-check env t1 t2) t)
-                    (type-mismatch () nil)
-                    (type-inequivalent () nil))))
+		      (prog2 (env-type-check env t1 t2) t)
+		    (type-mismatch () nil)
+		    (type-inequivalent () nil))))
       (format t "TYPE EQUIVALENTP ~a~%~a and~%~a~%~%" result t1 t2)
       result))
-  
+
   (defun env-type-memberp (env type value)
     (env-type-equivalentp env (env-reduce env type) (env-deduce-type env value)))
 #+end_src
@@ -2107,16 +2107,16 @@ consistent and make sense for the naturals.
 ***** 0 + x = x + 0 = x
 #+begin_src lisp
   (env-define default-env 'nat-add-1-z-id
-              :type
-              (forall '((x N))
-                      '(equal N (nat-add z x) x))
-              :value 'nat-add-1-z-id)
+	      :type
+	      (forall '((x N))
+		      '(equal N (nat-add z x) x))
+	      :value 'nat-add-1-z-id)
 
   (env-define default-env 'nat-add-2-z-id
-              :type
-              (forall '((x N))
-                      '(equal N (nat-add x z) x))
-              :value 'nat-add-2-z-id)
+	      :type
+	      (forall '((x N))
+		      '(equal N (nat-add x z) x))
+	      :value 'nat-add-2-z-id)
 #+end_src
 
 ***** x + (y + 1) = (x + 1) + y = (x + y) + 1
@@ -2150,7 +2150,7 @@ consistent and make sense for the naturals.
                                (nat-add (succ x) y)
                                (succ (nat-add x y))
                                (nat-add-1-comm-succ x y))))
-  
+
   (env-define-checked default-env 'nat-add-2-comm-succ-rev
                       :type
                       (forall '((x N) (y N))
@@ -2638,7 +2638,6 @@ via its paths.
 
 ** Higher inductive types
 A feeble attempt.
-
 *** The Interval
 #+begin_src lisp
   (env-define default-env 'Inter
